@@ -24,3 +24,4 @@ Tsinghua University & Shanghai AI Laboratory
   
 #### Dataset:
 * We have open-sourced the relevant dataset. For details, please refer to: https://doi.org/10.57760/sciencedb.27695
+* Test set LFIs and GT are now available for download, along with our reconstruction outputs and metric-calculation code. You can obtain the files using the following link: https://drive.google.com/drive/folders/10HUxP71PvZP5CyUULYUkoT-VYAylHysJ?usp=sharing
