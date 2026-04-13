@@ -65,7 +65,7 @@ def train(args):
 
     test_lfs = train_db.test_lf_imgs.to(device)
     psfs, warp_psfs, energy_rate = train_db.getPSF()
-    gauss_warp_psfs, psf_priors = train_db.getGaussPSF()
+    _, psf_priors = train_db.getGaussPSF()
     psf_energy_mean = torch.mean(psfs[0,...].sum(-1).sum(-1))
 
     u_res, z_res, psf_res, _ = psfs.shape
@@ -73,7 +73,7 @@ def train(args):
     remain_v = np.arange(1, u_res, 2)
 
     model = V2V3D(warp_psfs, z_res, select_v, remain_v, u_res, args.feat_ch,
-                  gauss_warp_psfs=gauss_warp_psfs).to(device)
+                  psf_priors=psf_priors).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr_init)
     epochs = args.decay_init + args.decay_every
     db_size = len(train_db)

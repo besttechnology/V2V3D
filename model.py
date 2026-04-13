@@ -120,19 +120,29 @@ class Feature(nn.Module):
         return x
 
 
-class GaussianFeatureAlignment(nn.Module):
-    """基于 Gaussian 软核的可学习特征对齐模块。
+class GaussianUnprojection(nn.Module):
+    """完整的 Gaussian Unprojection 特征对齐模块。
 
-    替代原始的 0/1 质心 mask + FFT 卷积对齐。
-    - 使用 PSF 先验生成的 Gaussian 软核做基础对齐
-    - 附加轻量预测头，对每个视图的特征预测逐深度的权重调整
-    - 残差设计：初始行为等价于使用 Gaussian 软核（无学习残差时）
+    将每个视图的 2D 特征像素视为 Gaussian Splat，通过可学习的 3D 参数
+    反投影到统一的 3D 特征空间。与 3DGS 的核心对应关系：
+
+    - 空间卷积核 = Gaussian Splat 的 2D 投影（位置 μ、尺度 σ 可学习）
+    - 深度权重 = Gaussian Splat 沿 z 轴的分布（中心、宽度可学习）
+    - 置信度 = Gaussian Splat 的不透明度 α
+
+    三组参数均采用残差设计，从 PSF 物理先验初始化：
+    - 空间核: centroid, sigma 初始化自 PSF 二阶矩拟合
+    - 深度权重: 初始近似平坦（不偏好任何深度）
+    - 置信度: 初始 = 1.0（不衰减）
+
+    初始行为完全等价于固定 Gaussian 软核对齐，训练中逐步学习优化。
     """
 
-    def __init__(self, gauss_warp_psfs, n_views, n_depths, feat_ch):
+    def __init__(self, psf_priors, n_views, n_depths, feat_ch):
         """
         Args:
-            gauss_warp_psfs: (U, Z, H_k, W_k) Gaussian 软卷积核（已裁剪）
+            psf_priors: dict, 包含 centroid (U,Z,2), sigma (U,Z,2),
+                        crop_min (int), kernel_size (H_k, W_k)
             n_views: 视图数量 U
             n_depths: 深度切片数 Z
             feat_ch: 特征通道数 C
@@ -140,33 +150,76 @@ class GaussianFeatureAlignment(nn.Module):
         super().__init__()
         self.n_views = n_views
         self.n_depths = n_depths
+        self.kernel_h, self.kernel_w = psf_priors['kernel_size']
 
-        # 注册 Gaussian 软核为 buffer（不参与梯度更新）
-        self.register_buffer('gauss_kernels', gauss_warp_psfs)  # (U, Z, H_k, W_k)
+        # ========== 空间对齐：可学习 Gaussian 卷积核 ==========
+        # PSF 先验（转换到裁剪坐标系）
+        crop_min = psf_priors['crop_min']
+        centroid = psf_priors['centroid'].clone()
+        centroid[:, :, 0] -= crop_min
+        centroid[:, :, 1] -= crop_min
 
-        # 可学习的逐深度权重调整参数预测头
-        # 输入: 特征图 (B*U, C, H, W) → 输出: 逐像素的深度权重调整 (B*U, Z, H, W)
-        self.depth_weight_head = nn.Sequential(
+        self.register_buffer('prior_cx', centroid[:, :, 0].contiguous())   # (U, Z)
+        self.register_buffer('prior_cy', centroid[:, :, 1].contiguous())   # (U, Z)
+        self.register_buffer('prior_sx', psf_priors['sigma'][:, :, 0].contiguous())  # (U, Z)
+        self.register_buffer('prior_sy', psf_priors['sigma'][:, :, 1].contiguous())  # (U, Z)
+
+        # 可学习残差：空间核参数
+        self.delta_cx = nn.Parameter(torch.zeros(n_views, n_depths))
+        self.delta_cy = nn.Parameter(torch.zeros(n_views, n_depths))
+        self.delta_log_sx = nn.Parameter(torch.zeros(n_views, n_depths))   # log 缩放，exp(0)=1
+        self.delta_log_sy = nn.Parameter(torch.zeros(n_views, n_depths))
+
+        # ========== 深度权重：逐像素 Gaussian-in-z ==========
+        # 预测头（视图间共享权重）
+        self.param_head = nn.Sequential(
             nn.Conv2d(feat_ch, feat_ch, 3, padding=1),
             nn.LeakyReLU(0.01, True),
-            nn.Conv2d(feat_ch, n_depths, 1),
+            nn.Conv2d(feat_ch, 3, 1),   # [delta_d, delta_log_w, logit_alpha]
         )
+        # 残差初始化：输出全 0
+        nn.init.zeros_(self.param_head[-1].weight)
+        nn.init.zeros_(self.param_head[-1].bias)
 
-        # 初始化预测头使初始输出接近 0（残差设计）
-        # 这样 sigmoid(0) = 0.5，乘以 2 后 = 1.0，等价于不调整
-        nn.init.zeros_(self.depth_weight_head[-1].weight)
-        nn.init.zeros_(self.depth_weight_head[-1].bias)
+        # z 轴索引（用于计算 Gaussian-in-z）
+        self.register_buffer('z_indices', torch.arange(n_depths, dtype=torch.float32))
 
-    def _gauss_warp(self, feats):
-        """用 Gaussian 软核对特征做 FFT 卷积对齐（替代原始 warp_feats）。
+    def _build_kernels(self):
+        """从可学习参数动态生成 Gaussian 软卷积核。
+
+        Returns:
+            kernels: (U, Z, H_k, W_k) 归一化的 Gaussian 核
+        """
+        # 残差叠加：prior + learnable delta
+        cx = self.prior_cx + self.delta_cx     # (U, Z)
+        cy = self.prior_cy + self.delta_cy
+        sx = (self.prior_sx * torch.exp(self.delta_log_sx)).clamp(min=0.3)   # (U, Z)
+        sy = (self.prior_sy * torch.exp(self.delta_log_sy)).clamp(min=0.3)
+
+        # 坐标网格
+        x_grid = torch.arange(self.kernel_w, device=cx.device, dtype=torch.float32)   # (W_k,)
+        y_grid = torch.arange(self.kernel_h, device=cy.device, dtype=torch.float32)   # (H_k,)
+
+        # 可分离 Gaussian：x 方向 (U,Z,W_k) 和 y 方向 (U,Z,H_k)
+        gx = torch.exp(-0.5 * ((x_grid[None, None, :] - cx[:, :, None]) / sx[:, :, None]) ** 2)
+        gy = torch.exp(-0.5 * ((y_grid[None, None, :] - cy[:, :, None]) / sy[:, :, None]) ** 2)
+
+        # 外积 → 2D Gaussian 核 (U, Z, H_k, W_k)
+        kernels = gy.unsqueeze(-1) * gx.unsqueeze(-2)
+        kernels = kernels / (kernels.sum(dim=(-2, -1), keepdim=True) + 1e-12)
+        return kernels
+
+    def _fft_warp(self, feats, kernels):
+        """用动态生成的 Gaussian 核对特征做 FFT 卷积对齐。
 
         Args:
-            feats: (U, C, H, W) 逐视图特征
+            feats: (U, C, H, W)
+            kernels: (U, Z, H_k, W_k)
         Returns:
-            warped: (U, C, Z, H, W) 对齐后的 3D 特征体
+            warped: (U, C, Z, H, W)
         """
         u, ch, ra, ca = feats.shape
-        _, z, rb, cb = self.gauss_kernels.shape
+        _, z, rb, cb = kernels.shape
 
         r = ra + rb - 1
         p1 = (r - ra) / 2
@@ -175,7 +228,7 @@ class GaussianFeatureAlignment(nn.Module):
         b1 = torch.zeros(u, 1, z, r, r, device=feats.device)
 
         a1[:, :, :, 0:ra, 0:ca] = feats.unsqueeze(2)
-        b1[:, :, :, 0:rb, 0:cb] = self.gauss_kernels.unsqueeze(1)
+        b1[:, :, :, 0:rb, 0:cb] = kernels.unsqueeze(1)
 
         projections = ifft2(fft2(a1) * fft2(b1))
         projections = torch.real(projections[:, :, :, int(p1):int(r - p1), int(p1):int(r - p1)])
@@ -187,21 +240,40 @@ class GaussianFeatureAlignment(nn.Module):
             feats: (U, C, H, W) 逐视图提取的特征
 
         Returns:
-            aligned: (U, C, Z, H, W) 对齐后的 3D 特征体（与原始 warp_feats 输出形状一致）
+            aligned: (U, C, Z, H, W) 对齐后的 3D 特征体
         """
         U, C, H, W = feats.shape
+        Z = self.n_depths
 
-        # Step 1: 用 Gaussian 软核做基础对齐
-        warped = self._gauss_warp(feats)   # (U, C, Z, H, W)
+        # Step 1: 动态生成可学习 Gaussian 空间卷积核
+        kernels = self._build_kernels()   # (U, Z, H_k, W_k)
 
-        # Step 2: 预测逐深度的权重调整
-        depth_logits = self.depth_weight_head(feats)   # (U, Z, H, W)
-        # 残差设计：sigmoid(0)=0.5, ×2=1.0 → 初始不改变权重
-        depth_weights = 2.0 * torch.sigmoid(depth_logits)   # (U, Z, H, W) 范围 (0, 2)
-        depth_weights = depth_weights.unsqueeze(1)   # (U, 1, Z, H, W) 广播到 C 维
+        # Step 2: FFT 卷积实现空间对齐
+        warped = self._fft_warp(feats, kernels)   # (U, C, Z, H, W)
 
-        # Step 3: 加权调整
-        aligned = warped * depth_weights
+        # Step 3: 逐像素深度权重预测（Gaussian-in-z）
+        params = self.param_head(feats)            # (U, 3, H, W)
+        delta_d = params[:, 0:1]                   # (U, 1, H, W) 深度中心偏移
+        delta_log_w = params[:, 1:2]               # (U, 1, H, W) 深度宽度缩放
+        logit_alpha = params[:, 2:3]               # (U, 1, H, W) 置信度
+
+        # 深度 Gaussian 参数（残差设计）
+        depth_center = (Z / 2.0) + delta_d                       # 初始 = Z/2
+        depth_width = (Z * 10.0) * torch.exp(delta_log_w)        # 初始 = Z*10（近似平坦）
+        confidence = torch.sigmoid(logit_alpha)                   # 初始 = 0.5
+
+        # 扩展维度用于广播: (U, 1, 1, H, W) vs z_idx (1, 1, Z, 1, 1)
+        depth_center = depth_center.unsqueeze(2)                  # (U, 1, 1, H, W)
+        depth_width = depth_width.unsqueeze(2)                    # (U, 1, 1, H, W)
+        confidence = confidence.unsqueeze(2)                      # (U, 1, 1, H, W)
+        z_idx = self.z_indices.view(1, 1, Z, 1, 1)               # (1, 1, Z, 1, 1)
+
+        # Gaussian-in-z 权重，乘以 2×confidence 使初始值 ≈ 1.0
+        depth_weights = torch.exp(-0.5 * ((z_idx - depth_center) / (depth_width + 1e-6)) ** 2)
+        depth_weights = 2.0 * confidence * depth_weights          # (U, 1, Z, H, W)
+
+        # Step 4: 加权调整
+        aligned = warped * depth_weights   # (U, C, Z, H, W)
 
         return aligned
 
@@ -273,18 +345,18 @@ class Unet(nn.Module):
     
 class V2V3D(nn.Module):
     def __init__(self,warp_psfs,n_slice,select_v,remain_v,use_views=13,feat_ch=4,
-                 gauss_warp_psfs=None):
+                 psf_priors=None):
         super().__init__()
         self.use_v = use_views
         self.feat_ch = feat_ch
         self.select_v = select_v
         self.remain_v = remain_v
 
-        self.use_gauss_align = gauss_warp_psfs is not None
+        self.use_gauss_align = psf_priors is not None
 
         if self.use_gauss_align:
-            self.gauss_align = GaussianFeatureAlignment(
-                gauss_warp_psfs, use_views, n_slice, feat_ch)
+            self.gauss_align = GaussianUnprojection(
+                psf_priors, use_views, n_slice, feat_ch)
         else:
             self.warp_psfs = warp_psfs
 

@@ -151,10 +151,13 @@ def genGaussianWarpPSFs(psfs, sigma_clamp=(0.5, 10.0)):
     crop_max = min(min(height, width), coords_max + pad)
     gauss_warp_psfs = gauss_psfs[:, :, crop_min:crop_max, crop_min:crop_max]
 
+    kernel_size = (int(crop_max - crop_min), int(crop_max - crop_min))
+
     psf_priors = {
         'centroid': centroids,         # (U, Z, 2)  质心坐标 (在原始未裁剪坐标系中)
         'sigma': sigmas,               # (U, Z, 2)  标准差
-        'crop_min': crop_min,          # 裁剪偏移量，用于坐标转换
+        'crop_min': int(crop_min),     # 裁剪偏移量，用于坐标转换
+        'kernel_size': kernel_size,    # (H_crop, W_crop) 裁剪后核尺寸
     }
 
     return gauss_warp_psfs, psf_priors

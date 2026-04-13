@@ -49,7 +49,7 @@ def test(args):
     if test_lfs.ndim == 3: test_lfs = torch.unsqueeze(test_lfs, dim=0)
     
     psfs, warp_psfs, energy_rate = train_db.getPSF()
-    gauss_warp_psfs, psf_priors = train_db.getGaussPSF()
+    _, psf_priors = train_db.getGaussPSF()
 
     u_res, z_res, psf_res, _ = psfs.shape
     select_v = np.arange(0, u_res, 2)
@@ -57,7 +57,7 @@ def test(args):
 
     print(f"Loading: {args.model_path}")
     model = V2V3D(warp_psfs, z_res, select_v, remain_v, u_res, args.feat_ch,
-                  gauss_warp_psfs=gauss_warp_psfs).to(device)
+                  psf_priors=psf_priors).to(device)
     model.load_state_dict(torch.load(args.model_path))
     model.eval()
     
