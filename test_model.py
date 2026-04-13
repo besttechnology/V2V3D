@@ -64,7 +64,7 @@ def test(args):
             test_lf_img = test_lfs[i, ...]
             _, _, xguess = model(test_lf_img)
             base_name = test_lf_names[i]
-            recon_save_path = os.path.join(result_dir, base_name + '_recon.tif')
+            recon_save_path = os.path.join(result_dir, base_name + '.tif')
             if args.use_amp:
                 recon_data = torch.squeeze(xguess / train_db.amp[i]).cpu().numpy().astype(np.float32)
             else:

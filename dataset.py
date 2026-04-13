@@ -42,23 +42,23 @@ class SyntheticData(Dataset):
 
     def getTestLF(self,select_all):
 
-        self.test_lf_names = [
-            'Immune_cells_Neutrophil',
-            ]
-        
-        if not select_all: self.test_lf_names = [self.test_lf_names[3]]
-        
-        self.test_lf_imgs = []; self.amp = torch.zeros((len(self.test_lf_names)))
-        for i,test_lf_name in enumerate(self.test_lf_names):
-            test_lf_name = test_lf_name+self.postfix
-            lf_path = os.path.join(self.lf_dir,test_lf_name)
+        if select_all:
+            test_files = self.lf_names
+        else:
+            test_files = [self.lf_names[0]]
+
+        self.test_lf_names = [os.path.splitext(f)[0] for f in test_files]
+
+        self.test_lf_imgs = []; self.amp = torch.zeros((len(test_files)))
+        for i,filename in enumerate(test_files):
+            lf_path = os.path.join(self.lf_dir,filename)
             self.test_lf_img = torch.from_numpy(tf.imread(lf_path).astype(np.float32)).squeeze()
             if torch.max(self.test_lf_img)>32767: self.test_lf_img = self.test_lf_img-32767 
             self.test_lf_img = F.relu(self.test_lf_img)
             self.amp[i] = 0.2/torch.mean(self.test_lf_img)
             self.test_lf_img = self.amp[i]*self.test_lf_img
             self.test_lf_imgs.append(self.test_lf_img)
-            print('Loading Test LF: %s'%test_lf_name,' Amplify:',self.amp[i].item())
+            print('Loading Test LF: %s'%filename,' Amplify:',self.amp[i].item())
         self.test_lf_imgs = torch.stack(self.test_lf_imgs,dim=0)
         print('Test Dataset size:',self.test_lf_imgs.shape[0])
 
