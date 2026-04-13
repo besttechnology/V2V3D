@@ -67,8 +67,8 @@ def genWarpPSFs(psfs):
         psf_flip = psfs_flip[i,...]
         masks = []
         for z in range(depth):
-            slice_tensor = psf_flip[z,...] 
-            M = torch.sum(slice_tensor)  
+            slice_tensor = psf_flip[z,...]
+            M = torch.sum(slice_tensor)
 
             x_coords = torch.arange(width).view(1, -1)  # 1 x W
             y_coords = torch.arange(height).view(-1, 1)  # H x 1
@@ -76,8 +76,8 @@ def genWarpPSFs(psfs):
             C_x = torch.sum(x_coords * slice_tensor) / M
             C_y = torch.sum(y_coords * slice_tensor) / M
 
-            mask = torch.zeros((height, width), dtype=torch.float32) 
-            C_x_int = round(C_x.item()) 
+            mask = torch.zeros((height, width), dtype=torch.float32)
+            C_x_int = round(C_x.item())
             C_y_int = round(C_y.item())
             mask[C_y_int, C_x_int] = 1
             masks.append(mask)
@@ -92,6 +92,72 @@ def genWarpPSFs(psfs):
 
     psfs_warp = psfs_warp[:,:,coords_min-1:coords_max+1,coords_min-1:coords_max+1]
     return psfs_warp
+
+def genGaussianWarpPSFs(psfs, sigma_clamp=(0.5, 10.0)):
+    """对每个视图每个深度的 PSF 切片拟合 2D Gaussian，生成软卷积核。
+
+    返回:
+        gauss_warp_psfs: (U, Z, H_crop, W_crop) 以 Gaussian 权重替代 0/1 mask 的软核
+        psf_priors: dict 包含 centroid (U, Z, 2) 和 sigma (U, Z, 2)
+    """
+    psfs_flip = torch.flip(psfs, dims=[-2, -1])
+    u_res, depth, height, width = psfs_flip.shape
+
+    centroids = torch.zeros(u_res, depth, 2)   # (cx, cy)
+    sigmas = torch.zeros(u_res, depth, 2)       # (sx, sy)
+    gauss_psfs = []
+
+    x_coords = torch.arange(width, dtype=torch.float32).view(1, -1)   # 1 x W
+    y_coords = torch.arange(height, dtype=torch.float32).view(-1, 1)   # H x 1
+
+    for u in range(u_res):
+        gauss_slices = []
+        for z in range(depth):
+            s = psfs_flip[u, z]   # (H, W)
+            M = torch.sum(s) + 1e-12
+
+            # 质心
+            cx = torch.sum(x_coords * s) / M
+            cy = torch.sum(y_coords * s) / M
+
+            # 二阶矩 → 标准差
+            sx = torch.sqrt(torch.sum(((x_coords - cx) ** 2) * s) / M).clamp(*sigma_clamp)
+            sy = torch.sqrt(torch.sum(((y_coords - cy) ** 2) * s) / M).clamp(*sigma_clamp)
+
+            centroids[u, z, 0] = cx
+            centroids[u, z, 1] = cy
+            sigmas[u, z, 0] = sx
+            sigmas[u, z, 1] = sy
+
+            # 生成 Gaussian 软核
+            gauss = torch.exp(-0.5 * (((x_coords - cx) / sx) ** 2 + ((y_coords - cy) / sy) ** 2))
+            gauss = gauss / (gauss.sum() + 1e-12)   # 归一化使能量守恒
+            gauss_slices.append(gauss)
+
+        gauss_psfs.append(torch.stack(gauss_slices, dim=0))  # (Z, H, W)
+
+    gauss_psfs = torch.stack(gauss_psfs, dim=0)   # (U, Z, H, W)
+
+    # 裁剪到有效区域（与原始 genWarpPSFs 保持一致的裁剪逻辑）
+    # 用 3σ 阈值确定有效范围
+    gauss_sum = gauss_psfs.sum(dim=0).sum(dim=0)   # (H, W)
+    threshold = gauss_sum.max() * 1e-4
+    coords = torch.nonzero(gauss_sum > threshold)
+    coords_min = coords.min(dim=0)[0].min()
+    coords_max = coords.max(dim=0)[0].max() + 1
+
+    pad = 1
+    crop_min = max(0, coords_min - pad)
+    crop_max = min(min(height, width), coords_max + pad)
+    gauss_warp_psfs = gauss_psfs[:, :, crop_min:crop_max, crop_min:crop_max]
+
+    psf_priors = {
+        'centroid': centroids,         # (U, Z, 2)  质心坐标 (在原始未裁剪坐标系中)
+        'sigma': sigmas,               # (U, Z, 2)  标准差
+        'crop_min': crop_min,          # 裁剪偏移量，用于坐标转换
+    }
+
+    return gauss_warp_psfs, psf_priors
 
 # Utils for data processing
 def normal(input):

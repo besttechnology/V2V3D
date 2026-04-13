@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch
 from torch.nn import functional as F
+from torch.fft import fft2, ifft2
 from utils import warp_feats
 import numpy as np
 
@@ -117,7 +118,94 @@ class Feature(nn.Module):
         x = torch.cat([l3, self.branch1(l3), self.branch2(l3), self.branch3(l3)], 1)
         x = self.lastconv(x)
         return x
-    
+
+
+class GaussianFeatureAlignment(nn.Module):
+    """基于 Gaussian 软核的可学习特征对齐模块。
+
+    替代原始的 0/1 质心 mask + FFT 卷积对齐。
+    - 使用 PSF 先验生成的 Gaussian 软核做基础对齐
+    - 附加轻量预测头，对每个视图的特征预测逐深度的权重调整
+    - 残差设计：初始行为等价于使用 Gaussian 软核（无学习残差时）
+    """
+
+    def __init__(self, gauss_warp_psfs, n_views, n_depths, feat_ch):
+        """
+        Args:
+            gauss_warp_psfs: (U, Z, H_k, W_k) Gaussian 软卷积核（已裁剪）
+            n_views: 视图数量 U
+            n_depths: 深度切片数 Z
+            feat_ch: 特征通道数 C
+        """
+        super().__init__()
+        self.n_views = n_views
+        self.n_depths = n_depths
+
+        # 注册 Gaussian 软核为 buffer（不参与梯度更新）
+        self.register_buffer('gauss_kernels', gauss_warp_psfs)  # (U, Z, H_k, W_k)
+
+        # 可学习的逐深度权重调整参数预测头
+        # 输入: 特征图 (B*U, C, H, W) → 输出: 逐像素的深度权重调整 (B*U, Z, H, W)
+        self.depth_weight_head = nn.Sequential(
+            nn.Conv2d(feat_ch, feat_ch, 3, padding=1),
+            nn.LeakyReLU(0.01, True),
+            nn.Conv2d(feat_ch, n_depths, 1),
+        )
+
+        # 初始化预测头使初始输出接近 0（残差设计）
+        # 这样 sigmoid(0) = 0.5，乘以 2 后 = 1.0，等价于不调整
+        nn.init.zeros_(self.depth_weight_head[-1].weight)
+        nn.init.zeros_(self.depth_weight_head[-1].bias)
+
+    def _gauss_warp(self, feats):
+        """用 Gaussian 软核对特征做 FFT 卷积对齐（替代原始 warp_feats）。
+
+        Args:
+            feats: (U, C, H, W) 逐视图特征
+        Returns:
+            warped: (U, C, Z, H, W) 对齐后的 3D 特征体
+        """
+        u, ch, ra, ca = feats.shape
+        _, z, rb, cb = self.gauss_kernels.shape
+
+        r = ra + rb - 1
+        p1 = (r - ra) / 2
+
+        a1 = torch.zeros(u, ch, 1, r, r, device=feats.device)
+        b1 = torch.zeros(u, 1, z, r, r, device=feats.device)
+
+        a1[:, :, :, 0:ra, 0:ca] = feats.unsqueeze(2)
+        b1[:, :, :, 0:rb, 0:cb] = self.gauss_kernels.unsqueeze(1)
+
+        projections = ifft2(fft2(a1) * fft2(b1))
+        projections = torch.real(projections[:, :, :, int(p1):int(r - p1), int(p1):int(r - p1)])
+        return projections
+
+    def forward(self, feats):
+        """
+        Args:
+            feats: (U, C, H, W) 逐视图提取的特征
+
+        Returns:
+            aligned: (U, C, Z, H, W) 对齐后的 3D 特征体（与原始 warp_feats 输出形状一致）
+        """
+        U, C, H, W = feats.shape
+
+        # Step 1: 用 Gaussian 软核做基础对齐
+        warped = self._gauss_warp(feats)   # (U, C, Z, H, W)
+
+        # Step 2: 预测逐深度的权重调整
+        depth_logits = self.depth_weight_head(feats)   # (U, Z, H, W)
+        # 残差设计：sigmoid(0)=0.5, ×2=1.0 → 初始不改变权重
+        depth_weights = 2.0 * torch.sigmoid(depth_logits)   # (U, Z, H, W) 范围 (0, 2)
+        depth_weights = depth_weights.unsqueeze(1)   # (U, 1, Z, H, W) 广播到 C 维
+
+        # Step 3: 加权调整
+        aligned = warped * depth_weights
+
+        return aligned
+
+
 class Unet(nn.Module):
     def __init__(self,n_slices,input_channel):
         super().__init__()
@@ -184,29 +272,41 @@ class Unet(nn.Module):
         return f
     
 class V2V3D(nn.Module):
-    def __init__(self,warp_psfs,n_slice,select_v,remain_v,use_views=13,feat_ch=4):
-        super().__init__() 
+    def __init__(self,warp_psfs,n_slice,select_v,remain_v,use_views=13,feat_ch=4,
+                 gauss_warp_psfs=None):
+        super().__init__()
         self.use_v = use_views
         self.feat_ch = feat_ch
         self.select_v = select_v
         self.remain_v = remain_v
 
-        self.warp_psfs = warp_psfs
+        self.use_gauss_align = gauss_warp_psfs is not None
+
+        if self.use_gauss_align:
+            self.gauss_align = GaussianFeatureAlignment(
+                gauss_warp_psfs, use_views, n_slice, feat_ch)
+        else:
+            self.warp_psfs = warp_psfs
+
         self.feat_extract = Feature(in_channels=1,out_channels=feat_ch)
         self.unet1 = Unet(n_slices=n_slice,input_channel=feat_ch*select_v.shape[0]*n_slice)
         self.unet2 = Unet(n_slices=n_slice,input_channel=feat_ch*remain_v.shape[0]*n_slice)
         self.weight_init(mean=0.0, std=0.02)
-    
+
     def weight_init(self, mean, std):
         for m in self._modules:
             normal_init(self._modules[m], mean, std)
-    
+
     def forward(self,x):
 
         V,H,W = x.shape
         x = torch.unsqueeze(x,1) #v,c,h,w
         feats = self.feat_extract(x)
-        feats = warp_feats(self.warp_psfs,feats)
+
+        if self.use_gauss_align:
+            feats = self.gauss_align(feats)
+        else:
+            feats = warp_feats(self.warp_psfs,feats)
 
         volume1 = self.unet1(feats[self.select_v,...].reshape(1,len(self.select_v)*feats.shape[1]*feats.shape[2],H,W))
         volume2 = self.unet2(feats[self.remain_v,...].reshape(1,len(self.remain_v)*feats.shape[1]*feats.shape[2],H,W))

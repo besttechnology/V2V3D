@@ -13,8 +13,11 @@ class SyntheticData(Dataset):
 
         psfs = ut.load_psfs(psf_dir,Nnum)
         warp_psfs = ut.genWarpPSFs(psfs)
+        gauss_warp_psfs, psf_priors = ut.genGaussianWarpPSFs(psfs)
         self.psfs = psfs.to(device)
         self.warp_psfs = warp_psfs.to(device)
+        self.gauss_warp_psfs = gauss_warp_psfs.to(device)
+        self.psf_priors = psf_priors
         psf_mean = torch.mean(self.psfs,dim=0).mean(-1).mean(-1)
         self.energy_rate = psf_mean/psf_mean.mean()
         
@@ -66,6 +69,9 @@ class SyntheticData(Dataset):
     
     def getPSF(self):
         return self.psfs, self.warp_psfs, self.energy_rate
+
+    def getGaussPSF(self):
+        return self.gauss_warp_psfs, self.psf_priors
     
     def __len__(self):
         return self.lf_imgs.shape[0]
