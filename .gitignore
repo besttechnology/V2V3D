@@ -1,0 +1,35 @@
+# ===== 数据 / 训练产物(体量大,不入 git)=====
+Dataset/
+Checkpoints/
+Log/
+Results/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ===== 模型权重 / 大文件 =====
+*.mdl
+*.pth
+*.ckpt
+*.tif
+*.tiff
+
+# ===== 训练日志 =====
+*_log.txt
+train_log.txt
+train_gauss_log.txt
+train_gauss_unproj_log.txt
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# ===== 本机笔记 / 备份 =====
+requirements-full.txt
+GaussV2V3D.md
+测试流程.txt

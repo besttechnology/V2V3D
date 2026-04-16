@@ -1,0 +1,16 @@
+# V2V3D 训练 / 推理依赖(从 conda 环境 v2v3D 提取)
+# 环境: Python 3.x, CUDA 12.1
+#
+# 安装(新服务器):
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+#
+# 如 CUDA 版本不同,请到 https://pytorch.org 选对应 torch / torchvision wheel
+
+torch==2.5.1
+torchvision==0.20.1
+numpy==2.2.6
+tifffile==2025.5.10
+ConfigArgParse==1.7.1
+tqdm==4.67.1
+torchmetrics==1.8.2
+tensorboard==2.20.0
