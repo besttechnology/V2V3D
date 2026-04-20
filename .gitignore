@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Runtime artifacts
+Checkpoints/
+Log/
+Results/
+train_log.txt
+train_*_log.txt
+
+# Dataset runtime subdirs (generated/downloaded, not source)
+Dataset/LFIs/
+Dataset/LFIs_test/
+Dataset/Samples_test/
+Dataset/V2V3D_recon/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
