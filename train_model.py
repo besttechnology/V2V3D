@@ -7,9 +7,9 @@ import time
 import os
 import configargparse
 from utils import test2b, adjust_lr, generate_fps, save_ckpt, normal
-from loss import fftloss, deCrosstalk_loss, posloss, zloss
+from loss import fftloss, deCrosstalk_loss, posloss, zloss, gauss_total_reg
 from dataset import SyntheticData
-from model import V2V3D
+from model import V2V3D, V2V3D_Gauss
 
 def parse_args():
     parser = configargparse.ArgumentParser(
@@ -36,7 +36,19 @@ def parse_args():
     parser.add_argument('--decay_every', type=int, default=20)
     
     parser.add_argument('--log', type=str, default='', help='specific log')
-    
+
+    # --- Gaussian Decoder 相关 ---
+    parser.add_argument('--use_gaussian', action='store_true',
+                        help='使用 V2V3D_Gauss（Gaussian Decoder + Intensity Voxelizer）')
+    parser.add_argument('--gauss_scale_init', type=float, default=0.5)
+    parser.add_argument('--gauss_s_min', type=float, default=0.1)
+    parser.add_argument('--gauss_s_max', type=float, default=3.0)
+    parser.add_argument('--gauss_lambda_scale', type=float, default=1e-2)
+    parser.add_argument('--gauss_lambda_sparse', type=float, default=1e-3)
+    parser.add_argument('--gauss_lambda_aniso', type=float, default=1e-4)
+    parser.add_argument('--gauss_reg_warmup', type=int, default=2,
+                        help='前几个 epoch 不施加 Gaussian 正则，只用 MSE')
+
     return parser.parse_args()
 
 def train(args):
@@ -71,7 +83,16 @@ def train(args):
     select_v = np.arange(0, u_res, 2)
     remain_v = np.arange(1, u_res, 2)
 
-    model = V2V3D(warp_psfs, z_res, select_v, remain_v, u_res, args.feat_ch).to(device)
+    if args.use_gaussian:
+        model = V2V3D_Gauss(
+            warp_psfs, z_res, select_v, remain_v,
+            input_size=args.input_size, use_views=u_res, feat_ch=args.feat_ch,
+            scale_init=args.gauss_scale_init,
+            s_min=args.gauss_s_min, s_max=args.gauss_s_max,
+        ).to(device)
+        print('[V2V3D] use_gaussian=True — Gaussian Decoder + Intensity Voxelizer')
+    else:
+        model = V2V3D(warp_psfs, z_res, select_v, remain_v, u_res, args.feat_ch).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr_init)
     epochs = args.decay_init + args.decay_every
     db_size = len(train_db)
@@ -105,6 +126,16 @@ def train(args):
                 loss = loss_mse + loss_fft * 0.5 + loss_pos * 1e-3
                 if args.dc_weight > 0: loss += deCrosstalk_loss(cv, xguess, psf_energy_mean) * args.dc_weight
                 if args.tv_weight > 0: loss += zloss(xguess) * args.tv_weight
+
+                if args.use_gaussian and epoch >= args.gauss_reg_warmup:
+                    gp1, gp2 = model.last_gauss_params
+                    loss = loss + gauss_total_reg(
+                        [gp1, gp2],
+                        lambda_s=args.gauss_lambda_scale,
+                        lambda_sp=args.gauss_lambda_sparse,
+                        lambda_a=args.gauss_lambda_aniso,
+                        s_max=args.gauss_s_max,
+                    )
                 
                 optimizer.zero_grad()
                 loss.backward()
