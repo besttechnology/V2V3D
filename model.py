@@ -272,7 +272,8 @@ class V2V3D_Gauss(nn.Module):
 
     def __init__(self, warp_psfs, n_slice, select_v, remain_v,
                  input_size, use_views=13, feat_ch=4,
-                 scale_init=0.5, s_min=0.1, s_max=None, max_offset=0.5):
+                 scale_init=0.5, s_min=0.1, s_max=None, max_offset=0.5,
+                 skip_voxelizer=False):
         super().__init__()
         self.use_v = use_views
         self.feat_ch = feat_ch
@@ -284,6 +285,7 @@ class V2V3D_Gauss(nn.Module):
         self.s_min = s_min
         self.s_max = s_max
         self.max_offset = max_offset
+        self.skip_voxelizer = bool(skip_voxelizer)
 
         self.warp_psfs = warp_psfs
         self.feat_extract = Feature(in_channels=1, out_channels=feat_ch)
@@ -292,9 +294,12 @@ class V2V3D_Gauss(nn.Module):
         self.unet2 = GaussianUnet(n_slices=n_slice,
                                   input_channel=feat_ch * remain_v.shape[0] * n_slice)
 
-        # lazy import to avoid hard dep when flag off
-        from voxelizer import IntensityVoxelizer
-        self.voxelizer = IntensityVoxelizer(n_slice=n_slice, H=input_size, W=input_size)
+        if not self.skip_voxelizer:
+            # lazy import to avoid hard dep when flag off
+            from voxelizer import IntensityVoxelizer
+            self.voxelizer = IntensityVoxelizer(n_slice=n_slice, H=input_size, W=input_size)
+        else:
+            self.voxelizer = None
 
         # 预计算网格锚点；注册为 buffer 便于 .to(device)
         grid = make_grid_centers(D=n_slice, H=input_size, W=input_size)
@@ -317,6 +322,12 @@ class V2V3D_Gauss(nn.Module):
             max_offset=self.max_offset,
             s_min=self.s_min, s_max=self.s_max,
         )
+        if self.voxelizer is None:
+            # Hybrid path: caller will render LFI directly from gp; return
+            # zero volume placeholder so the (volume1, volume2, volume) tuple
+            # contract is preserved.
+            volume = feats_sub.new_zeros(1, self.n_slice, self.H, self.W)
+            return volume, gp
         volume, _ = self.voxelizer(
             gp['positions'], gp['densities'], gp['scales'], gp['rotations'],
         )

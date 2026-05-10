@@ -17,6 +17,10 @@ Dataset/LFIs_test/
 Dataset/Samples_test/
 Dataset/V2V3D_recon/
 
+# Hybrid renderer ephemera
+logs/
+psf_fit_vis/
+
 # Editor / OS
 .vscode/
 .idea/
