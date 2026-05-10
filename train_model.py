@@ -65,6 +65,13 @@ def parse_args():
     parser.add_argument('--hybrid_no_checkpoint', action='store_true',
                         help='关闭 gradient checkpoint。默认开（forward 慢 ~1.5x，'
                              '但 backward 内存大幅下降，可处理更多 Gaussian）')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                        help='梯度裁剪 L2 范数上限（0=关闭）。Hybrid 路径强烈建议保留 '
+                             '默认 1.0，否则 ρ 容易指数级爆炸 → softplus 溢出 → NaN。')
+    parser.add_argument('--rho_max', type=float, default=20.0,
+                        help='ρ 软上限（每个 step 后 clamp 到此值）。0=关闭。Hybrid '
+                             '路径强烈建议保留默认 20，进一步防止 ρ 失控。仅作用于 '
+                             'V2V3D_Gauss 的 rho 通道 logits（前 z_slices 个 bias 输出）。')
     parser.add_argument('--hybrid_rho_bias', type=float, default=None,
                         help='覆盖 init_gaussian_head_bias 默认 rho_bias=-5。Hybrid '
                              '路径建议设置为 0~-2（让初始 ρ ≈ 0.1~0.7，渲染输出量级'
@@ -103,7 +110,7 @@ def _hybrid_filter_topk(gp, rho_threshold, max_gaussians):
 
 
 def _hybrid_soft_filter(gp, rho_threshold, max_gaussians, explore_frac=0.3,
-                        soft_temp=0.001):
+                        soft_temp=0.001, rho_max=20.0):
     """Soft top-K filter for hybrid renderer.
 
     Selects max_gaussians Gaussians per iter:
@@ -146,6 +153,11 @@ def _hybrid_soft_filter(gp, rho_threshold, max_gaussians, explore_frac=0.3,
         idx = top_idx
 
     rho_picked = rho[idx]                        # tensor with grad
+    # Hard upper bound on ρ before rendering. Prevents rendered output from
+    # exploding when network parameters drift large; gradient still flows
+    # through the unclamped values (clamp is differentiable a.e.).
+    if rho_max > 0:
+        rho_picked = rho_picked.clamp(max=rho_max)
     soft_mask = torch.sigmoid((rho_picked - rho_threshold) / soft_temp)
     rho_eff = rho_picked * soft_mask
     return pos[idx], sca[idx], rho_eff, idx.numel(), N
@@ -261,11 +273,13 @@ def train(args):
                     p1, s1, r1, n_kept1, n_total = _hybrid_soft_filter(
                         gp1, args.hybrid_rho_threshold, args.hybrid_max_gaussians,
                         explore_frac=args.hybrid_explore_frac,
-                        soft_temp=args.hybrid_soft_temp)
+                        soft_temp=args.hybrid_soft_temp,
+                        rho_max=args.rho_max)
                     p2, s2, r2, n_kept2, _ = _hybrid_soft_filter(
                         gp2, args.hybrid_rho_threshold, args.hybrid_max_gaussians,
                         explore_frac=args.hybrid_explore_frac,
-                        soft_temp=args.hybrid_soft_temp)
+                        soft_temp=args.hybrid_soft_temp,
+                        rho_max=args.rho_max)
                     g1 = GaussianBatch(positions=p1, sigmas=s1, rhos=r1)
                     g2 = GaussianBatch(positions=p2, sigmas=s2, rhos=r2)
                     gen_remain_lfs = hybrid_renderer(g1, target_views=remain_v.tolist())
@@ -301,8 +315,27 @@ def train(args):
                     )
                 
                 optimizer.zero_grad()
+
+                # NaN guard: if forward produced non-finite loss, skip this
+                # step entirely so backward doesn't pollute parameters.
+                if not torch.isfinite(loss):
+                    print(f'[WARN] non-finite loss at iter {iter+1}: '
+                          f'{loss.item()}; skipping backward+step')
+                    iter += 1
+                    continue
+
                 loss.backward()
+
+                # Gradient clipping: standard remedy for exploding gradients
+                # in hybrid path. Without this ρ can blow up exponentially
+                # within a few iters once it leaves the softplus near-zero
+                # regime, leading to NaN.
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=args.grad_clip)
+
                 optimizer.step()
+
                 iter += 1
 
                 loss_total_mse += loss_mse.cpu().item()
