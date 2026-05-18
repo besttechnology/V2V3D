@@ -53,6 +53,14 @@ def parse_args():
     parser.add_argument('--use_hybrid', action='store_true',
                         help='用 HybridRenderer 直接 gauss→LFI，跳过 voxelizer+generate_fps '
                              '路径。仅在 --use_gaussian 时生效。')
+    parser.add_argument('--hybrid_mode', type=str, default='raw_exact',
+                        choices=['raw_exact', 'continuous_fourier'],
+                        help='HybridRenderer 内部模式。'
+                             'raw_exact: voxel-sample Gaussian + 原始 PSF FFT 卷积，'
+                             'μ_xy 整数 anchor 无亚像素梯度（保留为对照基线）。'
+                             'continuous_fourier: 解析 2D-Gaussian FT + 相位移位，'
+                             'μ_xy 亚像素精确可微（Phase 1: z 维仍 nearest）。'
+                             'centered_affine 在训练侧不开放（需 PSF_centered.pt + offset 表）。')
     parser.add_argument('--hybrid_rho_threshold', type=float, default=0.01,
                         help='只渲染 ρ > threshold 的 Gaussian（控制速度）')
     parser.add_argument('--hybrid_max_gaussians', type=int, default=20000,
@@ -222,7 +230,7 @@ def train(args):
         h_z = min(z_res - 1, h_z)
         hybrid_renderer = HybridRenderer(
             psfs, (args.input_size, args.input_size),
-            z_norm='mean', mode='raw_exact',
+            z_norm='mean', mode=args.hybrid_mode,
             fixed_half_xy=h_xy, fixed_half_z=h_z,
             chunk_size=args.hybrid_chunk_size,
             use_checkpoint=not args.hybrid_no_checkpoint,
@@ -239,8 +247,8 @@ def train(args):
                     b[0:z_res] = args.hybrid_rho_bias
             print(f'[V2V3D] override rho_bias = {args.hybrid_rho_bias} '
                   f'(init ρ ≈ {torch.nn.functional.softplus(torch.tensor(float(args.hybrid_rho_bias))).item():.3f})')
-        print(f'[V2V3D] use_hybrid=True — HybridRenderer (half_xy={h_xy}, '
-              f'half_z={h_z}, chunk={args.hybrid_chunk_size}, '
+        print(f'[V2V3D] use_hybrid=True — HybridRenderer (mode={args.hybrid_mode}, '
+              f'half_xy={h_xy}, half_z={h_z}, chunk={args.hybrid_chunk_size}, '
               f'ρ_thr={args.hybrid_rho_threshold}, max_g={args.hybrid_max_gaussians})')
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr_init)

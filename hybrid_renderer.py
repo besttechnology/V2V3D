@@ -1,6 +1,6 @@
 """Hybrid Gaussian → real-PSF renderer.
 
-Two modes implemented:
+Three modes implemented:
 
 mode="raw_exact" (Phase 1):
     Use raw PSF; splat each Gaussian's local conv patch around its rounded
@@ -22,6 +22,27 @@ mode="centered_affine" (Phase 2/3):
       "bilinear" — 4-corner weighted splat using floor/frac of continuous
                    anchor. Recovers PSF sub-pixel info; this is what
                    Phase 3 differentiable training will use.
+
+mode="continuous_fourier" (Phase 1 of the continuization plan):
+    Use *raw* PSF (no centering, no offset table). Skip voxel-grid Gaussian
+    sampling entirely: build the Gaussian's analytical 2D Fourier transform
+    directly on the (r_x, r_y) DFT grid that matches psf_freq, then multiply
+    and irfft2. The sub-voxel position of mu_xy is encoded as a phase ramp
+    exp(-2πi(fx·mu_local_x + fy·mu_local_y)) — exact, smoothly differentiable.
+    The xy envelope is the closed-form Gaussian FT
+        ρ · 2π σx σy · exp(-2π²(σx² fx² + σy² fy²)).
+    Splat anchor stays at the integer (cx_idx, cy_idx) — the raw PSF carries
+    the view/depth-dependent shift, just like raw_exact.
+
+    Phase 1 of this mode: z dimension stays nearest-z (Gaussian z-density
+    evaluated at integer voxel centers in the local box, same as raw_exact's
+    discrete sampling). Sub-voxel mu_z gradient flows through the analytic
+    density formula but is quantized at the box level. Phase 2 (future)
+    will replace this with an analytic erf-based integral over each slice
+    interval, giving full mu_z sub-voxel grad continuity.
+
+    Requires fixed_half_xy and fixed_half_z (uses pre-FFT'd psf_freq cache).
+    centroid_offset / splat_mode are not used.
 
 Coordinate convention (matches gaussian_utils.make_grid_centers):
     position = (x, y, z) where
@@ -150,7 +171,7 @@ class HybridRenderer(nn.Module):
     ):
         super().__init__()
         assert psf.ndim == 4, f"psf shape must be (U,Z,ph,pw), got {psf.shape}"
-        assert mode in ("raw_exact", "centered_affine"), \
+        assert mode in ("raw_exact", "centered_affine", "continuous_fourier"), \
             f"unsupported mode={mode!r}"
         assert z_norm in ("mean", "sum")
         assert splat_mode in ("round", "bilinear"), \
@@ -160,6 +181,17 @@ class HybridRenderer(nn.Module):
                 "raw_exact mode requires splat_mode='round': the raw PSF "
                 "already carries sub-pixel shift via FFT conv, so bilinear "
                 "splat would double-count the offset.")
+        if mode == "continuous_fourier":
+            if fixed_half_xy is None or fixed_half_z is None:
+                raise ValueError(
+                    "continuous_fourier mode requires fixed_half_xy and "
+                    "fixed_half_z (uses pre-FFT'd psf_freq cache for the "
+                    "analytic-Gaussian freq-domain compute path).")
+            if splat_mode != "round":
+                raise ValueError(
+                    "continuous_fourier mode requires splat_mode='round': "
+                    "the analytic Gaussian's phase shift already encodes the "
+                    "sub-voxel mu_xy position inside the patch content.")
         self.register_buffer('psf', psf, persistent=False)
         self.U, self.Z, self.ph, self.pw = psf.shape
         self.H, self.W = image_shape
@@ -446,16 +478,24 @@ class HybridRenderer(nn.Module):
         # re-runs this function instead of saving the (N_c, Vt, Bz, r_x, ry2)
         # complex tensor (~hundreds of MB per chunk) — essential for any
         # nontrivial Gaussian count during training.
-        compute_args = (mu, sigma_c, rho, xs_world, ys_world, zs_world,
-                        bx_valid, by_valid, bz_valid, bz_global, view_idx)
+        if self.mode == "continuous_fourier":
+            # Analytic Gaussian FT path: skip xs/ys/bx/by — μ_xy sub-voxel
+            # info is encoded as phase shift in the closed-form FT.
+            compute_args = (mu, sigma_c, rho, cx_idx, cy_idx,
+                            zs_world, bz_valid, bz_global, view_idx)
+            compute_fn = self._chunk_freq_compute_continuous
+        else:
+            compute_args = (mu, sigma_c, rho, xs_world, ys_world, zs_world,
+                            bx_valid, by_valid, bz_valid, bz_global, view_idx)
+            compute_fn = self._chunk_freq_compute
         if self.use_checkpoint and torch.is_grad_enabled() and rho.requires_grad:
             from torch.utils.checkpoint import checkpoint
             patches = checkpoint(
-                self._chunk_freq_compute, *compute_args,
+                compute_fn, *compute_args,
                 use_reentrant=False,
             )
         else:
-            patches = self._chunk_freq_compute(*compute_args)
+            patches = compute_fn(*compute_args)
 
         Vt = view_idx.numel()
 
@@ -466,7 +506,11 @@ class HybridRenderer(nn.Module):
             cz = int(cz_idx[g].item())
             patch_g = patches[g]                                  # (Vt, r_x, r_y)
 
-            if self.mode == "raw_exact":
+            if self.mode in ("raw_exact", "continuous_fourier"):
+                # Both: integer anchor at (cx, cy). For raw_exact the raw PSF
+                # carries the centroid shift; for continuous_fourier the
+                # analytic FT's phase term carries the sub-voxel mu_xy shift
+                # inside the patch.
                 for u_out_idx in range(Vt):
                     self._splat(out, u_out_idx, patch_g[u_out_idx],
                                 cx, cy, half_xy, half_xy, r_x, r_y, 1.0)
@@ -566,6 +610,119 @@ class HybridRenderer(nn.Module):
         out_freq = (v_freq_b * psf_g).sum(dim=2)
 
         patches = torch.fft.irfft2(out_freq, s=(r_x, r_y))
+        if self.z_norm == "mean":
+            patches = patches / float(self.Z)
+        return patches
+
+    # ------------------------------------------------------------------
+    # Continuous-Fourier freq-domain compute (Phase 1: analytic xy, nearest-z)
+    # ------------------------------------------------------------------
+    def _chunk_freq_compute_continuous(
+        self,
+        mu, sigma_c, rho,
+        cx_idx, cy_idx,
+        zs_world, bz_valid, bz_global, view_idx,
+    ):
+        """Analytic 2D-Gaussian FT path. Skips voxel-grid xy sampling.
+
+        For each Gaussian, builds the continuous 2D Gaussian Fourier transform
+        directly on the (r_x, r_y) DFT grid that matches psf_freq:
+
+            G_hat(fx, fy) = ρ · 2π σx σy
+                          · exp(-2π² (σx² fx² + σy² fy²))      [envelope]
+                          · exp(-2πi (fx · mu_local_x
+                                    + fy · mu_local_y))         [phase]
+
+        where mu_local_* is the Gaussian center expressed in the local box
+        coordinate system (same as the implicit coord used by rfft2 of v_pad):
+            mu_local_x = mu_x - (cx_idx - half_xy + 0.5)
+                       = (mu_x - cx_idx - 0.5) + half_xy
+
+        When mu lies exactly on an integer voxel center, mu_local equals
+        half_xy and the result reduces (modulo Gaussian truncation error) to
+        the discretely-sampled path. When mu has a sub-voxel offset δ, the
+        phase ramp exp(-2πi · f · δ) materializes that offset in the patch
+        — fully smooth and analytically differentiable in mu_xy.
+
+        Phase 1 of this mode keeps z handling identical to raw_exact: nearest
+        PSF z slice + Gaussian z-density sampled at integer voxel centers.
+        Sub-voxel mu_z grad flows through the density formula but is
+        quantized at the box level. (Phase 2 will replace with erf-based
+        slice integral.)
+        """
+        device = mu.device
+        dtype = mu.dtype
+        N_c, Bz = bz_global.shape
+        r_x = self.r_x
+        r_y = self.r_y
+        half_xy = self.fixed_half_xy
+
+        # --- Local-box mu position ------------------------------------------
+        # mu_local = (mu_world − (cx_idx + 0.5)) + half_xy
+        # When mu_world = cx_idx + 0.5 (integer voxel center), mu_local = half_xy.
+        mu_local_x = (mu[:, 0] - cx_idx.to(dtype) - 0.5) + float(half_xy)
+        mu_local_y = (mu[:, 1] - cy_idx.to(dtype) - 0.5) + float(half_xy)
+
+        # --- Frequency grids matching psf_freq layout -----------------------
+        # rfft2 over (r_x, r_y): full bins for the inner H-axis (fx via
+        # fftfreq) and half bins for the outer W-axis (fy via rfftfreq).
+        # Units: cycles per voxel.
+        fx = torch.fft.fftfreq(r_x, device=device, dtype=dtype)        # (r_x,)
+        fy = torch.fft.rfftfreq(r_y, device=device, dtype=dtype)       # (r_y//2+1,)
+
+        sx = sigma_c[:, 0][:, None, None]    # (N_c, 1, 1)
+        sy = sigma_c[:, 1][:, None, None]
+        fx_g = fx[None, :, None]             # (1, r_x, 1)
+        fy_g = fy[None, None, :]             # (1, 1, r_y//2+1)
+
+        # --- Envelope (real, magnitude of continuous Gaussian FT) -----------
+        # 2π · σx · σy · exp(-2π² (σx² fx² + σy² fy²))
+        two_pi = 2.0 * math.pi
+        two_pi_sq = 2.0 * math.pi * math.pi
+        envelope = (two_pi * sx * sy) * torch.exp(
+            -two_pi_sq * (sx * sx * fx_g * fx_g + sy * sy * fy_g * fy_g)
+        )                                   # (N_c, r_x, r_y//2+1), real
+
+        # --- Phase ramp encoding sub-voxel mu position ----------------------
+        # exp(-2πi (fx · mu_local_x + fy · mu_local_y))
+        phase_arg = (
+            fx_g * mu_local_x[:, None, None]
+            + fy_g * mu_local_y[:, None, None]
+        )                                   # (N_c, r_x, r_y//2+1)
+        # Build complex via real cos/sin (autograd-friendly; equivalent to
+        # torch.complex but lets us multiply with the real envelope first to
+        # cut one complex op).
+        amp = rho[:, None, None] * envelope             # real, (N_c, r_x, ry2)
+        cos_p = torch.cos(-two_pi * phase_arg)
+        sin_p = torch.sin(-two_pi * phase_arg)
+        v_freq = torch.complex(amp * cos_p, amp * sin_p)  # complex, (N_c, r_x, ry2)
+
+        # --- z-direction weighting (Phase 1: nearest-z + sampled density) ---
+        # Gaussian z density evaluated at integer voxel z centers in the
+        # local box. Identical to what _chunk_freq_compute samples on the
+        # z-axis; the difference vs that path is only in xy.
+        sz = sigma_c[:, 2][:, None]                                    # (N_c, 1)
+        mu_z = mu[:, 2][:, None]                                       # (N_c, 1)
+        z_density = torch.exp(-0.5 * ((zs_world - mu_z) / sz) ** 2)    # (N_c, Bz)
+        z_density = z_density * bz_valid.to(dtype)
+
+        # --- Gather & weight PSF spectra over local z -----------------------
+        Vt = view_idx.numel()
+        psf_freq_views = self.psf_freq.index_select(0, view_idx)        # (Vt, Z, r_x, ry2)
+        ry2 = psf_freq_views.shape[-1]
+        bz_clamped = bz_global.clamp(0, self.Z - 1)
+        bz_idx = bz_clamped[:, None, :, None, None].expand(
+            N_c, Vt, Bz, r_x, ry2)
+        psf_freq_exp = psf_freq_views.unsqueeze(0).expand(
+            N_c, Vt, self.Z, r_x, ry2)
+        psf_g = torch.take_along_dim(psf_freq_exp, bz_idx, dim=2)       # (N_c, Vt, Bz, r_x, ry2)
+
+        z_w = z_density[:, None, :, None, None].to(psf_g.dtype)         # complex weights (imag=0)
+        psf_weighted = (psf_g * z_w).sum(dim=2)                         # (N_c, Vt, r_x, ry2)
+
+        # --- Final spectrum, irfft → patches --------------------------------
+        out_freq = v_freq.unsqueeze(1) * psf_weighted                   # (N_c, Vt, r_x, ry2)
+        patches = torch.fft.irfft2(out_freq, s=(r_x, r_y))              # (N_c, Vt, r_x, r_y)
         if self.z_norm == "mean":
             patches = patches / float(self.Z)
         return patches
