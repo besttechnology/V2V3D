@@ -398,6 +398,96 @@ Phase 2b (cubic / Hermite) ── 实现 + 对比 2a，量化高阶收益（消�
 
 **建议**：Phase 2 的产出不应只是"实现一个 linear 版本"，而是"实现 linear + cubic 两档 + 一个 ablation 表"，量化插值阶 vs 重建质量 / 收敛速度的关系。这本身就是一个完整的实验故事。
 
+> **实测更新（见 §2.9）**：上述路径基于推测设计。`psf_z_spectrum.py` 实测显示 linear 误差 ~20% 不够用，cubic 仅比 linear 好 28%（达不到 spline 应有的质变），PSF 沿 z 是 strongly bandlimited。**实际路线变成：cubic 作为新 baseline（跳过 linear）→ sinc 主攻 → Fresnel parametric 作为论文 contribution**。
+
+### 2.9 PSF 沿 $z$ 的实测物理性质（关键数据）
+
+> 来源：`psf_z_spectrum.py` 对 `PSF_zoom2_39dz1_N13` (U=13, Z=39, dz=1) 的 spectrum + decimation 分析。
+
+#### A. 谱分析：强 bandlimited
+
+| z-频率 | 归一化功率 | 累计能量 |
+|---|---|---|
+| 0.026 cyc/vox（lowest non-DC） | 2.38 × 10⁻¹ | — |
+| 0.128 cyc/vox（quarter-Nyquist） | 3.88 × 10⁻² | — |
+| 0.256 cyc/vox（half-Nyquist） | 2.54 × 10⁻³ | 99.8% |
+| 0.487 cyc/vox（Nyquist） | **3.07 × 10⁻⁵** | 100% |
+
+- Nyquist / lowest 能量比 = **1.3 × 10⁻⁴**（比 §2.8.D 的 "strongly bandlimited" 阈值 0.01 还低两个数量级）
+- **99.8% 能量在 0.3 cyc/vox 以下**，Nyquist 处仅 3e-5
+
+物理含义：PSF 沿 z 的高频内容衰减极快。Whittaker–Shannon 意义下 **sinc 插值在数学上接近无损**，dz=1 是充分采样而非欠采样——这与 §3.2 的"光学衍射系统轴向 bandlimited"假设吻合，也排除了"dz 太粗，所有方法都不够"的情况。
+
+#### B. Decimation 实验：linear 不够用，cubic 不质变
+
+PSF 沿 z 二倍下采样（保留偶 z 切片），用各方法插值回奇切片，与真值的 rel L2：
+
+| 方法 | rel L2 | 距理论 floor | 评价 |
+|---|---|---|---|
+| linear | **19.68%** | ~12 pp | 不够用 |
+| cubic | **14.10%** | ~7 pp | 改善但不质变 |
+| sinc（理论上限） | ~**7%** | 0 | 物理可达 |
+| cubic / linear 比例 | **0.72** | — | 期望 < 0.5 |
+
+理论 floor 估算：decimation 把 Nyquist 砍半（0.5 → 0.25），丢掉 [0.25, 0.5] 区间能量。从累计分数推断该区间约占 0.5–1%，所以任何插值方法的 rel L2 下界 ≈ √0.005 ≈ 7%。
+
+#### C. 关键观察：bandlimited vs 插值方法各自的高频伪影
+
+谱分析说"强 bandlimited"，decimation 却说"linear 20% 误差"——**两者不矛盾**：
+
+- 真实 PSF 的**连续 z 形状**几乎全在 < 0.3 cyc/vox（bandlimited）
+- 但 **linear / cubic 这类局部多项式插值**有自身引入的高频伪影：linear 角点 → sinc² 包络；cubic → 二阶导不连续处的高频内容
+- 这些**插值方法本身的高频**贡献了主要误差，与原信号 bandlimited 性质独立
+- 只有 **sinc / Fourier 插值**能真正达到 bandlimited 信号的 reconstruction 下限
+
+cubic / linear = 0.72 说明 cubic 把 linear 误差砍了 28%——**真改善但不是质变**。如果 PSF 真"spline-friendly"，应看到 $O(h^4)/O(h^2)$ 的优势，即 cubic 把误差砍到 linear 的 1/3–1/2。28% 改善表明 PSF 沿 z 的结构**无法被局部多项式良好近似**，需要全局（频域）方法。
+
+#### D. Phase 2 实现路线修订
+
+原 §2.8.E 推测路线：
+
+```
+旧: linear (Phase 2a)  →  cubic (Phase 2b)  →  sinc (备选)
+```
+
+修订路线：
+
+```
+新: cubic spline (Phase 2 MVP, §3.1)
+        │   依据：linear 已知 20% 误差，没必要写完就扔
+        ▼
+    sinc / Fourier z (主攻, §3.2)
+        │   依据：PSF strongly bandlimited，sinc 物理可达 ~7% floor
+        │         结构上与 §1 xy 解析 Fourier 对称
+        ▼
+    Fresnel parametric (paper, §3.6)
+        │   并行推进；论文方法学 contribution
+```
+
+linear 仅保留作消融对照（确认"为什么不能更便宜"），不作为 baseline。
+
+#### E. 优先级矩阵更新
+
+| 插值方法 | 原优先级 | 新优先级 | 改动原因 |
+|---|---|---|---|
+| linear (§2.4) | P0 (Phase 2 起点) | **P2** (仅消融) | 实测 20% 误差太高 |
+| Hermite (§3.7) | P1 (中间档) | **P2** | 与 cubic 同阶，cubic 已经够好 |
+| **cubic spline (§3.1)** | P1 | **P0 (新 baseline)** | 直接作为 Phase 2 MVP |
+| **sinc / Fourier z (§3.2)** | P2 (进阶) | **P0 (主攻)** | 物理 bandlimited 验证 |
+| Fresnel parametric (§3.6) | P2 (论文) | **P1** (论文 + 独立路径) | 并行推进，作为论文卖点 |
+
+#### F. 复现命令
+
+```bash
+pip install scipy
+python3 psf_z_spectrum.py \
+  --psf_dir PSF/PSF_zoom2_39dz1_N13 \
+  --Nnum 13 \
+  --out psf_z_spectrum.png
+```
+
+输出文件 `psf_z_spectrum.png` 包含两幅图：per-view + mean 功率谱（loglog）和累计能量分数曲线。
+
 ---
 
 ## 3. 未来可能方向
@@ -555,23 +645,29 @@ $$
 
 **第一里程碑**：Phase 2 完成 + 在真实数据集上和 raw_exact / Phase 1 做长训练 (50+ epoch) 对比，验证 z 可微是否能解开 ρ 收敛瓶颈。
 
-**第二里程碑**：Phase 2 的插值阶消融——同时实现 linear 与 cubic / Hermite 两档，在 C5（vs upsampled reference）和真实数据集训练曲线上做对比，量化插值阶对精度与收敛的影响。
+**第二里程碑（已修订，见 §2.9）**：Phase 2 直接 cubic spline 起步（跳过 linear，linear 实测 20% 误差不够用），sinc 作为后续主攻方向（物理 floor ~7%）。
 
-**决策分支**：
+**决策分支（修订版）**：
 
 ```
-Phase 2a 跑通 (linear)
+Phase 2 cubic spline 实现 + 跑通
    │
    ├─ 训练收敛速度 / 重建质量比 Phase 1 显著提升？
    │   ├─ 是 → "z 可微是主因"假设成立，Phase 2 立项成功
    │   └─ 否 → 瓶颈在别处（top-K filter / ρ 初始化 / 数据 SNR），回去诊断
    │
    ▼
-Phase 2b (cubic / Hermite) 对照
+Phase 2 sinc / Fourier z 实现
+   │   依据：§2.9 实测 cubic ~14% 距 sinc 理论 floor ~7% 还差一半
    │
-   ├─ 在 C5 / 训练曲线上 cubic vs linear 差距大且收益落地？
-   │   ├─ 大 → 继续 sinc (§3.2) / Fresnel 物理模型 (§3.6)
-   │   └─ 小 → 停在 cubic，把工程精力转向 CUDA (§3.5) / 训练 scale up
+   ├─ sinc 在 C5（vs fine-grid reference）上把 cubic 的 14% 砍到 < 8%？
+   │   ├─ 是 → sinc 替换 cubic 作为主 forward，训练曲线再做一轮对照
+   │   └─ 否 → cubic 是工程最优选择，停在这里，转 CUDA (§3.5)
+   │
+   ▼
+Fresnel parametric (§3.6, 并行推进)
+   │   论文 contribution 方向，物理建模独立路径
+   └─ 若拟合残差 < 5%，作为方法学核心卖点写进论文
 ```
 
 ---
