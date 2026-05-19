@@ -262,23 +262,34 @@ class HybridRenderer(nn.Module):
                           dtype=gaussians.positions.dtype)
 
         N = gaussians.positions.shape[0]
-        if N == 0:
-            return out
 
-        if self.psf_freq is not None:
-            # Vectorized path: process Gaussians in chunks of chunk_size.
-            for chunk_start in range(0, N, self.chunk_size):
-                chunk_end = min(chunk_start + self.chunk_size, N)
-                self._render_chunk(out, gaussians, chunk_start, chunk_end,
-                                   target_views)
-        else:
-            # Per-Gaussian Python loop (original path).
-            for i in range(N):
-                mu = gaussians.positions[i]      # (3,) (x, y, z)
-                sigma = gaussians.sigmas[i]      # (3,) (sx, sy, sz)
-                rho = gaussians.rhos[i]
-                self._render_one(out, mu, sigma, rho, target_views)
-        return out
+        if N > 0:
+            if self.psf_freq is not None:
+                # Vectorized path: process Gaussians in chunks of chunk_size.
+                for chunk_start in range(0, N, self.chunk_size):
+                    chunk_end = min(chunk_start + self.chunk_size, N)
+                    self._render_chunk(out, gaussians, chunk_start, chunk_end,
+                                       target_views)
+            else:
+                # Per-Gaussian Python loop (original path).
+                for i in range(N):
+                    mu = gaussians.positions[i]      # (3,) (x, y, z)
+                    sigma = gaussians.sigmas[i]      # (3,) (sx, sy, sz)
+                    rho = gaussians.rhos[i]
+                    self._render_one(out, mu, sigma, rho, target_views)
+
+        # Ghost-grad guard: when every _splat call early-returned (all
+        # anchors fell outside (H, W)) or N==0, `out` is still the leaf
+        # zeros from above with no grad_fn, and loss.backward() would die
+        # with "element 0 ... does not have a grad_fn". The 0.0 multiplier
+        # keeps values unchanged but reconnects autograd to Gaussian params,
+        # so degenerate batches receive zero gradient instead of crashing.
+        zero_link = 0.0 * (
+            gaussians.positions.sum()
+            + gaussians.sigmas.sum()
+            + gaussians.rhos.sum()
+        )
+        return out + zero_link
 
     # ------------------------------------------------------------------
     # Per-Gaussian render
