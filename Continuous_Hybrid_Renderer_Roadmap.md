@@ -978,6 +978,93 @@ elif (mu[:, 0].max() >= self.H + 10) or (mu[:, 1].max() >= self.W + 10):
 
 至此四层防护构成完整的训练稳定性 envelope：数值层（前三层）+ 结构层（第四层）。
 
+### C.7 第五种失败模式：参数级 NaN 中毒（commit `0f2173f` / `29fb829`）
+
+> 来源：`gauss-continuous-fourier` 长训练 iter 192-927，**每个 iter loss=NaN 但被 NaN-guard skip**，模型再也回不来。和 §C.1 的 graph-break 不一样，这次 backward 没断，loss **数值** NaN 而非结构问题。
+
+#### 现象
+
+```
+Iters:[191/1618] MSE: 0.169 ... ρmax=5.000          ← 还正常
+[WARN] non-finite loss at iter 192: nan; skipping backward+step
+[WARN] non-finite loss at iter 193: nan; skipping backward+step
+...
+[WARN] non-finite loss at iter 927: nan; skipping backward+step   ← 700+ iter 全 skip
+```
+
+特点：**ρmax 已经顶到 cap=5.0 几十 iter**，与 §C.4 推荐的 rho_max=5 一致；soft_temp / lambda_sparse 仍是默认值。
+
+#### 根因链（chain A → B → C，三链路必须同时打补丁）
+
+```
+Chain C (前置条件):
+    ρ 饱和 cap=5  →  ρ 通道梯度被 sigmoid((ρ-thr)/0.001) 死区清零
+    →  loss 的 gradient 全部经 position / scale 流出
+    →  s_log (conv_final 的 scale 通道输出) 加速漂移
+
+Chain A (NaN 源):
+    s_log 漂到 > 87  →  exp(s_log) fp32 溢出 +Inf
+    →  forward 被 clamp(max=s_max=3.0) 屏蔽 (看不到问题)
+    →  backward: d(clamp)/d(s) = 0   ×   d(exp)/d(s_log) = exp = Inf
+                                  = NaN
+    →  NaN 沿 conv_final 反传到所有上游权重的 .grad
+
+Chain B (NaN 透传):
+    loss.backward() 出现 NaN grad，但 loss 数值是有限的
+    →  loss-level NaN guard 失效（loss 在 .backward 之后才坏）
+    →  clip_grad_norm_(error_if_nonfinite=False) 不过滤 NaN：
+       total_norm = NaN，clip_coef = NaN，"NaN < 1" 永远 False
+       → 不缩放就放行
+    →  optimizer.step() 给参数写入 NaN
+    →  下一 iter 起 forward 必然 NaN，无论输入；
+       loss-NaN guard 只是空跑数百 iter，参数永不复活
+```
+
+**关键洞察**：loss 有限 ≠ grad 有限。`0 × Inf = NaN` 在饱和 clamp + exp 链路上必然出现，而 `clip_grad_norm_` 默认不拒绝 NaN 是 PyTorch 已知行为，不是 bug。
+
+#### 数值复现
+
+```python
+import torch, torch.nn.functional as F
+sl = torch.tensor(100.0, requires_grad=True)
+y = (torch.exp(sl) * 0.5).clamp(max=3.0)   # 旧路径
+(g,) = torch.autograd.grad(y, sl)
+print(g, torch.isfinite(g))                # → tensor(nan), False
+
+sl = torch.tensor(200.0, requires_grad=True)
+y = (F.softplus(sl) * 0.5).clamp(max=3.0)  # 新路径
+(g,) = torch.autograd.grad(y, sl)
+print(g, torch.isfinite(g))                # → tensor(0.5000), True
+```
+
+#### 修复（三层叠加，缺一不可）
+
+| 链 | 修复点 | 位点 |
+|---|---|---|
+| Chain A | `exp(s_log) * scale_init` → `softplus(s_log) * scale_init`：softplus 在 s_log→∞ 退化为线性，grad = sigmoid(s_log) ∈ (0,1) 永远有界 | `gaussian_utils.py:43` |
+| Chain B | backward 后、step 前遍历 `model.parameters()` 检查 `torch.isfinite(p.grad)`，否则 `zero_grad` + skip。loss-level guard 不足够 | `train_model.py` 训练循环 |
+| Chain C | 新 CLI `--nan_abort_streak`（默认 20）：连续 N 次 loss/grad NaN 直接 `raise RuntimeError`，避免再出现 700+ iter 空跑 | `train_model.py` 训练循环 |
+
+初始 scale 从 `exp(0)*0.5 = 0.5` 变为 `softplus(0)*0.5 = 0.347`，仍在 `[s_min, s_max] = [0.1, 3.0]` 内，不影响 bootstrap 量级。
+
+#### 防护层叠加表（更新）
+
+| 失败模式 | 哪层防护抓 | commit |
+|---|---|---|
+| 梯度爆炸 | grad_clip | 5fe4d81 |
+| ρ 渲染溢出 | rho_max | 5fe4d81 |
+| loss 变 NaN（forward 已坏） | loss-NaN guard | 5fe4d81 |
+| loss 没 grad_fn（图断） | ghost-grad | c70f05b |
+| **scale exp 溢出 → NaN grad** | **softplus 激活** | **0f2173f / 29fb829** |
+| **NaN grad 透 clip_grad_norm → 参数中毒** | **grad-level NaN guard** | **0f2173f / 29fb829** |
+| **NaN-skip 死循环烧算力** | **nan_abort_streak abort** | **0f2173f / 29fb829** |
+
+至此七层防护：数值层（前三层）+ 结构层（第四层）+ 激活防溢出层（第五层）+ 梯度过滤层（第六层）+ 死循环熔断（第七层）。
+
+#### §C.4 建议参数的现状
+
+§C.4 推荐 `hybrid_soft_temp 0.05` / `gauss_lambda_sparse 1e-4` 治根 Chain C 的 ρ 饱和。当前默认仍是 `0.001 / 1e-3`，**未默认改动**。新的七层防护下，即使 Chain C 触发也不会污染参数，所以默认值是否调整可以等下一次长训练数据再决定。
+
 ---
 
 ## 附录 D：与现有分支与文档的对应
