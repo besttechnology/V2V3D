@@ -40,7 +40,11 @@ def decoder_output_to_gaussians(raw, grid_centers, scale_init=0.5,
     # 激活
     rho = F.softplus(rho_logit)
     mu_delta = torch.tanh(mu_offset) * max_offset          # 限制在 voxel 内
-    s = torch.exp(s_log) * scale_init                      # 乘初始尺度
+    # 用 softplus 代替 exp：softplus(s_log) 对任意有限 s_log 都返回有限值，
+    # 上极限 backward grad = sigmoid(s_log) ∈ (0,1) 永不爆炸。exp 在 s_log>87
+    # 时 fp32 溢出 +Inf，下游 clamp 把前向 mask 住但 backward 链 d(clamp)/d(s)=0
+    # 配 d(exp)=Inf 产出 NaN，连环污染参数。
+    s = F.softplus(s_log) * scale_init                     # 有界 grad、防溢出
     if s_min is not None or s_max is not None:
         s = s.clamp(min=s_min if s_min is not None else 1e-6,
                     max=s_max if s_max is not None else 1e6)
