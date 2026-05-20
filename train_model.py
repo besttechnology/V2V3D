@@ -97,6 +97,9 @@ def parse_args():
                              'sigmoid((ρ-threshold)/temp)。temp 越小越接近 hard 阈值。')
     parser.add_argument('--hybrid_smoke', type=int, default=0,
                         help='只跑前 N 个 iter 后退出（0=正常训练，>0=smoke 模式）')
+    parser.add_argument('--nan_abort_streak', type=int, default=20,
+                        help='连续 N 个 iter 出现 NaN/Inf loss 或 grad 则 raise '
+                             'RuntimeError，避免空跑数百 iter。0=关闭。')
 
     return parser.parse_args()
 
@@ -264,7 +267,10 @@ def train(args):
 
     loops = round(2000/db_size) if db_size<2000 else 1
     iters = loops*db_size
-    
+
+    # 连续 NaN 计数器：loss-NaN 或 grad-NaN 累计；finite step 重置为 0。
+    nan_streak = 0
+
     for epoch in range(epochs):
         loss_total_mse = 0; iter = 0
         optimizer = adjust_lr(args.lr_init, args.lr_decay, epoch, args.decay_init, args.decay_every, optimizer)
@@ -328,15 +334,45 @@ def train(args):
                 
                 optimizer.zero_grad()
 
-                # NaN guard: if forward produced non-finite loss, skip this
-                # step entirely so backward doesn't pollute parameters.
+                # NaN guard #1 (loss-level): forward 已经 NaN，backward 必然
+                # 也 NaN，跳过整个 step。
                 if not torch.isfinite(loss):
+                    nan_streak += 1
                     print(f'[WARN] non-finite loss at iter {iter+1}: '
-                          f'{loss.item()}; skipping backward+step')
+                          f'{loss.item()}; skipping backward+step '
+                          f'(nan_streak={nan_streak})')
+                    if args.nan_abort_streak > 0 and nan_streak >= args.nan_abort_streak:
+                        raise RuntimeError(
+                            f'aborted: {nan_streak} consecutive non-finite losses '
+                            f'— model is dead, restart with fresh params or fix '
+                            f'underlying numerical issue.')
                     iter += 1
                     continue
 
                 loss.backward()
+
+                # NaN guard #2 (grad-level): loss 有限 ≠ grad 有限。例如
+                # exp(s_log) 在饱和处 backward 产生 0×Inf=NaN，clip_grad_norm_
+                # 不过滤 NaN（NaN<1 永远 False，clip 直接放行）。Adam.step 写
+                # NaN → 参数死掉 → 后续所有 forward 永远 NaN。必须在 step 前
+                # 显式检测并 zero_grad。
+                has_nonfinite_grad = False
+                for p in model.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        has_nonfinite_grad = True
+                        break
+                if has_nonfinite_grad:
+                    nan_streak += 1
+                    print(f'[WARN] non-finite grad at iter {iter+1}; '
+                          f'skipping step (nan_streak={nan_streak})')
+                    optimizer.zero_grad()
+                    if args.nan_abort_streak > 0 and nan_streak >= args.nan_abort_streak:
+                        raise RuntimeError(
+                            f'aborted: {nan_streak} consecutive non-finite '
+                            f'grads — model is in pathological regime, restart '
+                            f'with fresh params or lower lr / s_max.')
+                    iter += 1
+                    continue
 
                 # Gradient clipping: standard remedy for exploding gradients
                 # in hybrid path. Without this ρ can blow up exponentially
@@ -347,6 +383,8 @@ def train(args):
                         model.parameters(), max_norm=args.grad_clip)
 
                 optimizer.step()
+                # 有 finite step 落地，连续 NaN 计数清零。
+                nan_streak = 0
 
                 iter += 1
 
