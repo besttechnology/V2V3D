@@ -63,3 +63,56 @@ Both scripts use `configargparse` — CLI flags override YAML config values.
 - Training: intermediate reconstructions saved every `epochs/10` epochs to `./Results/`
 - Testing: per-sample `{name}_recon.tif` files in `./Results/{checkpoint_name}_test/`
 - `use_amp` flag in test config rescales output by the per-image amplitude factor before saving
+
+## Extension: Gaussian Decoder + Hybrid Renderer (`gauss-*` branches)
+
+The `main` branch documents V2V3D as voxel-grid reconstruction. The active research line replaces the volume head with a **Gaussian primitive decoder** and renders directly to LF images via the **HybridRenderer**, skipping the voxelizer + `generate_fps` path.
+
+### Enabling
+
+```bash
+python train_model.py --use_gaussian --use_hybrid --hybrid_mode {raw_exact|continuous_fourier|continuous_zfourier}
+```
+
+`--use_gaussian` alone keeps the voxelizer path (Gaussian → voxel → PSF). Adding `--use_hybrid` replaces voxelizer with direct Gaussian → LFI rendering.
+
+### Three renderer modes (`hybrid_renderer.py`)
+
+| mode | xy μ sub-voxel | z μ sub-voxel | physical basis |
+|---|---|---|---|
+| `raw_exact` | ✗ (integer anchor splat) | ✗ (nearest-z) | baseline; matches voxel pipeline numerically |
+| `continuous_fourier` (Phase 1) | ✓ (analytic 2D Gaussian FT phase ramp) | ✗ (nearest-z) | xy fully sub-voxel differentiable |
+| `continuous_zfourier` (Phase 2) | ✓ | ✓ (1D Gaussian FT × cached PSF z-DFT) | full 3D Fourier closed form; sinc reconstruction of PSF along z |
+
+Math + verification plan: `Continuous_Hybrid_Renderer_Roadmap.md` (sections 1, 2.10, appendix C).
+
+### Key new files
+
+- `model.py::V2V3D_Gauss`, `model.py::GaussianUnet` — decoder head outputs 11×D channels per voxel (ρ, Δx, Δy, Δz, sx, sy, sz, qw, qx, qy, qz)
+- `gaussian_utils.py::decoder_output_to_gaussians` — activations (softplus ρ, tanh·max_offset μ, **softplus** s, normalize q) and grid anchor lift
+- `voxelizer.py::IntensityVoxelizer` — Gaussian → voxel rasterizer for the non-hybrid path
+- `hybrid_renderer.py::HybridRenderer` — three-mode renderer described above
+- `sanity_check_continuous.py` / `sanity_check_zfourier.py` — analytic verification of Phase 1 / Phase 2 modes (T1-T4 / ZA-ZE)
+
+### Training stability (see roadmap appendix C)
+
+The hybrid path has known instability modes documented in roadmap §C.1-C.7. Seven-layer defense:
+
+1. `--grad_clip 1.0` — exploding gradients
+2. `--rho_max 20` — render-output explosion (ρ soft cap)
+3. loss-level NaN guard — forward already produced NaN, skip backward
+4. ghost-grad guard — backward graph disconnect (degenerate splat batch)
+5. **softplus instead of exp for scale activation** — prevents `exp(s_log)` fp32 overflow → NaN grad chain (`gaussian_utils.py:43`)
+6. **grad-level NaN guard** — `clip_grad_norm_` doesn't filter NaN; explicit `torch.isfinite(p.grad)` check before `optimizer.step()`
+7. `--nan_abort_streak 20` — abort after N consecutive NaN losses/grads
+
+All are on by default. Hybrid-mode-specific knobs: `--hybrid_rho_bias` (init ρ near 0.2–0.7 for bootstrap match), `--hybrid_soft_temp` (gate sharpness; default 0.001 is hard, roadmap §C.4 recommends 0.05 if Chain C ρ saturation becomes a bottleneck).
+
+### Branch layout
+
+| branch | content |
+|---|---|
+| `main` | original voxel-only V2V3D |
+| `gauss-hybrid-renderer` | first hybrid renderer (raw_exact + centered_affine) + training integration |
+| `gauss-continuous-fourier` | Phase 1 (xy analytic FT) |
+| `gauss-continuous-zfourier` | Phase 2 (full 3D Fourier, sinc PSF along z) — current development branch |
