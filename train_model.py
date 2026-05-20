@@ -352,15 +352,18 @@ def train(args):
                 # 不过滤 NaN（NaN<1 永远 False，clip 直接放行）。Adam.step 写
                 # NaN → 参数死掉 → 后续所有 forward 永远 NaN。必须在 step 前
                 # 显式检测并 zero_grad。
-                has_nonfinite_grad = False
-                for p in model.parameters():
+                bad_params = []
+                for name, p in model.named_parameters():
                     if p.grad is not None and not torch.isfinite(p.grad).all():
-                        has_nonfinite_grad = True
-                        break
-                if has_nonfinite_grad:
+                        # 记录前 3 个就够定位上游来源——通常一条链路同时坏。
+                        bad_params.append(name)
+                        if len(bad_params) >= 3:
+                            break
+                if bad_params:
                     nan_streak += 1
                     print(f'[WARN] non-finite grad at iter {iter+1}; '
-                          f'skipping step (nan_streak={nan_streak})')
+                          f'skipping step (nan_streak={nan_streak}; '
+                          f'first bad params: {bad_params})')
                     optimizer.zero_grad()
                     if args.nan_abort_streak > 0 and nan_streak >= args.nan_abort_streak:
                         raise RuntimeError(
