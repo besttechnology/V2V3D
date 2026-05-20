@@ -499,6 +499,7 @@ class HybridRenderer(nn.Module):
         # re-runs this function instead of saving the (N_c, Vt, Bz, r_x, ry2)
         # complex tensor (~hundreds of MB per chunk) — essential for any
         # nontrivial Gaussian count during training.
+        Vt = view_idx.numel()
         if self.mode == "continuous_fourier":
             # Analytic Gaussian FT path: skip xs/ys/bx/by — μ_xy sub-voxel
             # info is encoded as phase shift in the closed-form FT.
@@ -514,60 +515,80 @@ class HybridRenderer(nn.Module):
             compute_args = (mu, sigma_c, rho, xs_world, ys_world, zs_world,
                             bx_valid, by_valid, bz_valid, bz_global, view_idx)
             compute_fn = self._chunk_freq_compute
+
+        # Splat: dispatch by mode. The three integer-anchor modes share an
+        # identical destination (cx_idx, cy_idx) and uniform weight 1.0, so
+        # they vectorize into one scatter. centered_affine has per-view
+        # continuous offsets and bilinear weights that vary per call, so it
+        # stays on the Python loop.
+        if self.mode in ("raw_exact", "continuous_fourier",
+                         "continuous_zfourier"):
+            # Fuse compute + vectorized splat into one checkpoint. autograd
+            # otherwise has to retain `patches` (N_c, Vt, r_x, r_y) per chunk
+            # to feed the splat's backward — at K=20000 chunk=64 that's
+            # 312 chunks × 41 MB = 13 GB just for patches storage. Fusing
+            # lets us retain only the final (Vt, H, W) contribution per
+            # chunk (140 MB total across all chunks).
+            def _compute_and_splat(*args):
+                patches_local = compute_fn(*args)
+                return self._splat_vectorized_pure(
+                    patches_local, cx_idx, cy_idx, half_xy, half_xy, Vt)
+
+            if self.use_checkpoint and torch.is_grad_enabled() and rho.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+                contribution = checkpoint(
+                    _compute_and_splat, *compute_args, use_reentrant=False)
+            else:
+                contribution = _compute_and_splat(*compute_args)
+            out.add_(contribution)
+            return
+
+        # ---- centered_affine path: original logic preserved ----
         if self.use_checkpoint and torch.is_grad_enabled() and rho.requires_grad:
             from torch.utils.checkpoint import checkpoint
             patches = checkpoint(
-                compute_fn, *compute_args,
-                use_reentrant=False,
-            )
+                compute_fn, *compute_args, use_reentrant=False)
         else:
             patches = compute_fn(*compute_args)
 
-        Vt = view_idx.numel()
-
-        # Splat per Gaussian × view (Python loop kept; cheap relative to FFT).
+        # Hoist GPU→CPU sync out of the per-Gaussian loop (cheap once,
+        # expensive N_c times). cz_list still needed for per-Gaussian z
+        # lookup of the centroid offset table.
+        cx_list = cx_idx.tolist()
+        cy_list = cy_idx.tolist()
+        cz_list = cz_idx.tolist()
         for g in range(N_c):
-            cx = int(cx_idx[g].item())
-            cy = int(cy_idx[g].item())
-            cz = int(cz_idx[g].item())
-            patch_g = patches[g]                                  # (Vt, r_x, r_y)
-
-            if self.mode in ("raw_exact", "continuous_fourier",
-                             "continuous_zfourier"):
-                # All three: integer anchor at (cx, cy). raw_exact uses the
-                # raw PSF's view-dependent centroid shift; both continuous_*
-                # modes encode mu_xy sub-voxel via analytic FT phase.
-                for u_out_idx in range(Vt):
+            cx = cx_list[g]
+            cy = cy_list[g]
+            cz = cz_list[g]
+            patch_g = patches[g]                              # (Vt, r_x, r_y)
+            cz_lookup = max(0, min(self.Z - 1, cz))
+            offs = self.centroid_offset[:, cz_lookup, :]      # (U, 2)
+            anchor_x_world = cx + 0.5
+            anchor_y_world = cy + 0.5
+            for u_out_idx, u in enumerate(target_views):
+                cont_h = anchor_x_world + offs[u, 0].item()
+                cont_w = anchor_y_world + offs[u, 1].item()
+                if self.splat_mode == "round":
                     self._splat(out, u_out_idx, patch_g[u_out_idx],
-                                cx, cy, half_xy, half_xy, r_x, r_y, 1.0)
-            else:  # centered_affine
-                cz_lookup = max(0, min(self.Z - 1, cz))
-                offs = self.centroid_offset[:, cz_lookup, :]      # (U, 2)
-                anchor_x_world = cx + 0.5
-                anchor_y_world = cy + 0.5
-                for u_out_idx, u in enumerate(target_views):
-                    cont_h = anchor_x_world + offs[u, 0].item()
-                    cont_w = anchor_y_world + offs[u, 1].item()
-                    if self.splat_mode == "round":
+                                int(round(cont_h)), int(round(cont_w)),
+                                half_xy, half_xy, r_x, r_y, 1.0)
+                else:  # bilinear
+                    lo_h = int(math.floor(cont_h))
+                    lo_w = int(math.floor(cont_w))
+                    fh = cont_h - lo_h
+                    fw = cont_w - lo_w
+                    for dh, dw, weight in (
+                        (0, 0, (1.0 - fh) * (1.0 - fw)),
+                        (0, 1, (1.0 - fh) * fw),
+                        (1, 0, fh * (1.0 - fw)),
+                        (1, 1, fh * fw),
+                    ):
+                        if weight == 0.0:
+                            continue
                         self._splat(out, u_out_idx, patch_g[u_out_idx],
-                                    int(round(cont_h)), int(round(cont_w)),
-                                    half_xy, half_xy, r_x, r_y, 1.0)
-                    else:  # bilinear
-                        lo_h = int(math.floor(cont_h))
-                        lo_w = int(math.floor(cont_w))
-                        fh = cont_h - lo_h
-                        fw = cont_w - lo_w
-                        for dh, dw, weight in (
-                            (0, 0, (1.0 - fh) * (1.0 - fw)),
-                            (0, 1, (1.0 - fh) * fw),
-                            (1, 0, fh * (1.0 - fw)),
-                            (1, 1, fh * fw),
-                        ):
-                            if weight == 0.0:
-                                continue
-                            self._splat(out, u_out_idx, patch_g[u_out_idx],
-                                        lo_h + dh, lo_w + dw,
-                                        half_xy, half_xy, r_x, r_y, weight)
+                                    lo_h + dh, lo_w + dw,
+                                    half_xy, half_xy, r_x, r_y, weight)
 
     # ------------------------------------------------------------------
     # Heavy freq-domain compute (checkpointable)
@@ -846,7 +867,7 @@ class HybridRenderer(nn.Module):
         return patches
 
     # ------------------------------------------------------------------
-    # Splat helper
+    # Splat helpers
     # ------------------------------------------------------------------
     def _splat(
         self,
@@ -875,6 +896,79 @@ class HybridRenderer(nn.Module):
         else:
             out[u_out_idx, i0_img:i1_img, j0_img:j1_img] += \
                 weight * patch_uv[i0_p:i1_p, j0_p:j1_p]
+
+    def _splat_vectorized_pure(
+        self,
+        patches: torch.Tensor,        # (N_c, Vt, r_x, r_y)
+        cx_idx: torch.Tensor,         # (N_c,) long — Gaussian x anchor
+        cy_idx: torch.Tensor,         # (N_c,) long — Gaussian y anchor
+        half_x: int,
+        half_y: int,
+        Vt: int,
+    ) -> torch.Tensor:
+        """One-shot scatter add of all (Gaussian × view) patches into a fresh
+        (Vt, H, W) contribution buffer.
+
+        Equivalent to the per-Gaussian Python splat loop with weight=1.0:
+            for g in range(N_c):
+                for v in range(Vt):
+                    contribution[v, i0:i1, j0:j1] += patches[g, v, ...]
+
+        but expressed as a single `index_add_` so all the GPU launches and
+        Python overhead collapse to one kernel call.
+
+        Returned as a fresh tensor (not in-place on the caller's `out`) so
+        the whole call can be safely wrapped in `checkpoint(...)` — the
+        intermediate flat_idx / mask / masked tensors (~100 MB per chunk)
+        then live only during forward, regenerated on backward.
+
+        Only valid for integer-anchor modes (raw_exact / continuous_fourier
+        / continuous_zfourier) where weight is uniformly 1.0; centered_affine
+        with bilinear weights must keep the Python loop.
+
+        Out-of-bounds pixels (Gaussian near image edge) are zeroed via a
+        validity mask rather than skipped — vectorized GPU scatter prefers
+        dense input over branchy code paths.
+        """
+        N_c, _, r_x, r_y = patches.shape
+        device = patches.device
+        H, W = self.H, self.W
+
+        # World-coord origin of each Gaussian's patch (top-left in image space).
+        ph_half = (self.ph - 1) // 2
+        pw_half = (self.pw - 1) // 2
+        base_x = cx_idx - half_x - ph_half               # (N_c,) long
+        base_y = cy_idx - half_y - pw_half               # (N_c,)
+
+        # Per-pixel image coords:  i_idx[g, dx] = base_x[g] + dx
+        dx = torch.arange(r_x, device=device, dtype=torch.long)
+        dy = torch.arange(r_y, device=device, dtype=torch.long)
+        i_idx = base_x[:, None] + dx[None, :]            # (N_c, r_x)
+        j_idx = base_y[:, None] + dy[None, :]            # (N_c, r_y)
+
+        # Bounds check (per dimension; combined later by broadcast).
+        valid_i = (i_idx >= 0) & (i_idx < H)             # (N_c, r_x) bool
+        valid_j = (j_idx >= 0) & (j_idx < W)             # (N_c, r_y)
+        i_safe = i_idx.clamp(0, H - 1)
+        j_safe = j_idx.clamp(0, W - 1)
+
+        # Mask broadcast to (N_c, 1, r_x, r_y) so it applies to all views.
+        mask = (valid_i[:, :, None] & valid_j[:, None, :])    # (N_c, r_x, r_y)
+        mask = mask[:, None, :, :].to(patches.dtype)          # (N_c, 1, r_x, r_y)
+        masked = patches * mask                                # (N_c, Vt, r_x, r_y)
+
+        # Flat 1D index into a (Vt, H, W) contribution viewed as (Vt*H*W,).
+        # idx = v*H*W + i_safe[g,dx]*W + j_safe[g,dy]
+        i_b = i_safe[:, None, :, None].expand(N_c, Vt, r_x, r_y)
+        j_b = j_safe[:, None, None, :].expand(N_c, Vt, r_x, r_y)
+        v_b = torch.arange(Vt, device=device, dtype=torch.long)[
+                  None, :, None, None].expand(N_c, Vt, r_x, r_y)
+        flat_idx = (v_b * (H * W) + i_b * W + j_b).reshape(-1)
+
+        # Allocate fresh contribution and scatter.
+        contribution = patches.new_zeros(Vt, H, W)
+        contribution.view(-1).index_add_(0, flat_idx, masked.reshape(-1))
+        return contribution
 
 
 # ---------------------------------------------------------------------------
