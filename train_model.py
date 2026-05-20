@@ -54,12 +54,16 @@ def parse_args():
                         help='用 HybridRenderer 直接 gauss→LFI，跳过 voxelizer+generate_fps '
                              '路径。仅在 --use_gaussian 时生效。')
     parser.add_argument('--hybrid_mode', type=str, default='raw_exact',
-                        choices=['raw_exact', 'continuous_fourier'],
+                        choices=['raw_exact', 'continuous_fourier',
+                                 'continuous_zfourier'],
                         help='HybridRenderer 内部模式。'
                              'raw_exact: voxel-sample Gaussian + 原始 PSF FFT 卷积，'
                              'μ_xy 整数 anchor 无亚像素梯度（保留为对照基线）。'
                              'continuous_fourier: 解析 2D-Gaussian FT + 相位移位，'
                              'μ_xy 亚像素精确可微（Phase 1: z 维仍 nearest）。'
+                             'continuous_zfourier: 在 continuous_fourier 基础上 z '
+                             '维也走 1D 解析 Fourier (sinc 重建 PSF)，μ_xy 与 μ_z '
+                             '都全可微 (Phase 2，见 roadmap §2.10)。'
                              'centered_affine 在训练侧不开放（需 PSF_centered.pt + offset 表）。')
     parser.add_argument('--hybrid_rho_threshold', type=float, default=0.01,
                         help='只渲染 ρ > threshold 的 Gaussian（控制速度）')

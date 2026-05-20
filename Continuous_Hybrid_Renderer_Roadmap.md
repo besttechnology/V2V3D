@@ -213,7 +213,7 @@ $$
 零阶矩用 erf：
 
 $$
-\mathcal{M}_0(a, b;\,\mu,\sigma) \;=\; \sigma\sqrt{\tfrac{\pi}{2}}\left[\mathrm{erf}\!\Big(\tfrac{b-\mu}{\sigma\sqrt{2}}\Big) - \mathrm{erf}\!\Big(\tfrac{a-\mu}{\sigma\sqrt{2}}\Big)\right]
+\mathcal{M}_0(a, b;\,\mu,\sigma) \;=\; \sigma\sqrt{\tfrac{\pi}{2}}\left[\mathrm{erf}\!\Big(\tfracclash{b-\mu}{\sigma\sqrt{2}}\Big) - \mathrm{erf}\!\Big(\tfrac{a-\mu}{\sigma\sqrt{2}}\Big)\right]
 $$
 
 一阶矩由分部积分给出。利用 $g_z'(z) = -\tfrac{z-\mu}{\sigma^2}\,g_z(z)$，即 $z\,g_z(z) = \mu\,g_z(z) - \sigma^2\,g_z'(z)$：
@@ -487,6 +487,152 @@ python3 psf_z_spectrum.py \
 ```
 
 输出文件 `psf_z_spectrum.png` 包含两幅图：per-view + mean 功率谱（loglog）和累计能量分数曲线。
+
+### 2.10 Phase 2 (sinc / 3D Fourier) — 数学推导与实现
+
+> 基于 §2.9 实测 PSF 沿 z strongly bandlimited 的依据，Phase 2 直接走 sinc 重建路线。结构上与 Phase 1 的 xy 解析 Fourier 完全对称——整个 forward 在频域里闭合，xy 与 z 两个维度的处理"形式同构"，这也是论文叙事最干净的形态。
+
+#### A. 出发点：完整 3D forward
+
+$$
+\text{LFI}_u(x', y') \;=\; \iiint G(x, y, z)\;\text{PSF}_u(x' - x,\, y' - y;\, z)\,\mathrm{d}x\,\mathrm{d}y\,\mathrm{d}z
+$$
+
+对每个 Gaussian $G_i = \rho_i\, g_{x_i}(x)\, g_{y_i}(y)\, g_{z_i}(z)$（可分离），积分变成
+
+$$
+\text{LFI}_{u,i}(x', y') \;=\; \int g_{z_i}(z)\,\Big[\big(g_{xy_i} \ast_{xy} \text{PSF}_u(\cdot,\cdot;\,z)\big)(x', y')\Big]\,\mathrm{d}z
+$$
+
+#### B. xy 维度沿用 Phase 1
+
+对 xy 卷积应用卷积定理（Phase 1 §1.2 公式不动）：
+
+$$
+\mathcal{F}_{xy}[\text{LFI}_{u,i}](f_x, f_y) \;=\; \widehat{g}_{xy_i}^{\text{cont}}(f_x, f_y)\;\cdot\;\underbrace{\int g_{z_i}(z)\,\widehat{\text{PSF}}_u(f_x, f_y;\,z)\,\mathrm{d}z}_{\text{inner}_z(f_x, f_y)}
+$$
+
+其中 $\widehat{g}_{xy}^{\text{cont}}$ 是 §1.2 的解析连续 2D Gaussian FT（含 $\rho$、envelope、相位项）。**Phase 1 的所有公式直接复用**，剩下要处理的只有 $\text{inner}_z$。
+
+#### C. z 维度走 Parseval 频域改写
+
+对函数乘积积分（注意**没有共轭**形式）：
+
+$$
+\int f(z)\,g(z)\,\mathrm{d}z \;=\; \int \widehat{f}(f_z)\,\widehat{g}(-f_z)\,\mathrm{d}f_z
+$$
+
+应用到 $\text{inner}_z$：
+
+$$
+\text{inner}_z(f_x, f_y) \;=\; \int \widehat{g_z}(-f_z)\;\mathcal{F}_z\!\left[\widehat{\text{PSF}}_u(f_x, f_y;\,\cdot)\right]\!(f_z)\,\mathrm{d}f_z \;=\; \int \widehat{g_z}(-f_z)\;\widehat{\text{PSF}}_u^{3D}(f_x, f_y, f_z)\,\mathrm{d}f_z
+$$
+
+其中 $\widehat{\text{PSF}}_u^{3D}$ 是 PSF 沿 $(x, y, z)$ 三维的**全 3D Fourier**。
+
+#### D. 离散 DFT 形式
+
+z 用长度 $Z$ 的 DFT 网格离散化（`fftfreq(Z)` 约定 $f_z^{(n)} \in [-1/2, 1/2)$）：
+
+$$
+\boxed{\;\widehat{\text{LFI}}_u(f_x, f_y) \;=\; \widehat{g}_{xy}^{\text{cont}}(f_x, f_y)\;\cdot\;\frac{1}{Z}\sum_{n=0}^{Z-1}\widehat{g_z}^{\text{cont}}(-f_z^{(n)})\;\cdot\;\widehat{\text{PSF}}_u^{3D}(f_x, f_y, f_z^{(n)})\;}
+$$
+
+三个关键点：
+
+1. $\widehat{g_z}^{\text{cont}}$ 用 **解析连续 Fourier**，不是 sampled Gaussian 的 DFT。对 $\sigma_z \ge 1$ 两者几乎相同；对 $\sigma_z < 0.5$ 差别显著（aliasing $\sim e^{-2\pi^2\sigma_z^2}$），此时必须用连续版本。
+2. $\widehat{\text{PSF}}^{3D}$ 用 PSF 数据的 **离散 DFT**（init 阶段缓存一次）。
+3. $\widehat{g_z}^{\text{cont}}(-f) = \sigma_z\sqrt{2\pi}\,e^{-2\pi^2\sigma_z^2 f^2}\,e^{+2\pi i f \mu_z}$（envelope 同号、phase 取共轭）。
+
+#### E. 与低阶插值（linear / cubic）的频域同构关系
+
+各种 PSF z-重建方法在频域都对应一个**包络函数** $\widehat{\phi}(f)$ 加权：
+
+| 方法 | $\phi(z)$ 空间核 | $\widehat{\phi}(f)$ 频域包络 | 频域效果 |
+|---|---|---|---|
+| nearest (Phase 1) | $\delta_k$ | $1$ | 离散点采样，无重建 |
+| linear / tent (§2.4) | $\Lambda(z)$ | $\text{sinc}^2(f)$ | 高频被 sinc² 压低 |
+| cubic B-spline (§3.1) | $B_3(z)$ | $\text{sinc}^4(f)$ | 高频被 sinc⁴ 压低 |
+| **sinc (本节)** | $\text{sinc}(z)$ | $\text{rect}(f)$ | 理想低通，bandlimited 信号无失真 |
+
+也就是说**低阶方法等于把 §2.10 的频域积分人为乘上一个 sinc² / sinc⁴ 包络**——它们没有"用更多信息"，而是"主动丢掉高频"。这从频域视角解释了 §2.9 实测 cubic 离 sinc 还有约一倍差距：cubic 把 $f$ 较大处的能量按 sinc⁴ 衰减掉了，而真实 PSF 在那些频率仍有内容（直到 Nyquist 才掉到 3e-5）。
+
+#### F. 实现路线
+
+##### 缓存（`HybridRenderer.__init__`）
+
+```python
+# Phase 1 已有：psf_xy_freq = rfft2(psf, dim=(-2, -1))  ← (U, Z, r_x, r_y/2+1) complex
+# 新增 z-axis FFT 缓存
+self.psf_zfreq = torch.fft.fft(self.psf_xy_freq, dim=-3)
+# shape: (U, Z, r_x, r_y/2+1) complex
+```
+
+z 维度用 `fft`（不是 `rfft`），因为输入已经是复数（xy rfft2 的输出）。
+
+##### 前向（新增 `_chunk_freq_compute_zfourier`）
+
+```python
+# 1) xy Gaussian FT (复用 Phase 1)
+g_xy_freq = phase1_envelope * phase1_phase                # (N_c, r_x, r_y/2+1)
+
+# 2) 1D Gaussian z-FT at NEGATIVE DFT frequencies
+fz = torch.fft.fftfreq(Z, device=device)                  # (Z,) in [-0.5, 0.5)
+gz_neg = (sigma_z[:, None] * (2*pi)**0.5
+          * torch.exp(-2 * pi**2 * sigma_z[:, None]**2 * fz**2)
+          * torch.exp(+2j * pi * fz * mu_z[:, None]))     # (N_c, Z) complex
+
+# 3) z-direction inner product in frequency
+weighted = (gz_neg[:, None, :, None, None]
+            * psf_zfreq[None, view_idx, :, :, :]).sum(dim=2) / Z
+# shape: (N_c, V_t, r_x, r_y/2+1)
+
+# 4) Combine xy and z, return to spatial
+full_freq = g_xy_freq[:, None, :, :] * weighted
+patches = torch.fft.irfft2(full_freq, s=(r_x, r_y))       # (N_c, V_t, r_x, r_y)
+
+# 5) Splat (复用 Phase 1)
+```
+
+##### CLI
+
+新增 `--hybrid_mode continuous_zfourier`，与 `raw_exact` / `continuous_fourier` 并列。`continuous_fourier` 保留作对照（Phase 1 即 xy-only continuous，z 仍 nearest）。
+
+#### G. 周期性与边界
+
+DFT 隐含 PSF 沿 z 周期化。真实 PSF 不是周期函数，理论上有 wraparound 误差。
+
+**实测**：本项目 PSF 在 z 边界处下溢到 ~1e-39（实际 0），wraparound 完全可忽略。
+
+**Paranoia 模式**：可在 init 阶段沿 z 零填充到 $Z_{\text{pad}} = 2Z$ 后再 DFT，把 wraparound 推到 dB 级噪底以下。代价 ~2× 内存 / 计算量，预期无可见收益。
+
+#### H. 性能对比
+
+| 维度 | Phase 1 (`continuous_fourier`) | Phase 2 (`continuous_zfourier`) |
+|---|---|---|
+| z 维度 per-Gaussian 工作 | $\sum_{k \in B_z}$（$B_z \approx 9$） | $\sum_n$（$Z = 39$） |
+| z 维度解析 FT 估值 | $\exp \times B_z$ | $\exp \times Z$ |
+| PSF 缓存 | `psf_xy_freq`（U, Z, rx, ry/2+1）complex | 同 + 同形状的 `psf_zfreq` |
+| $\mu_z$ 可微性 | ❌（nearest-z） | ✅（相位项编码） |
+| 物理精度 | 受 nearest-z 量化 | 接近 bandlimited floor（~7%） |
+
+per-Gaussian 计算量增量约 4×（$Z / B_z$ 倍）在 z 维度的乘加上，整体 forward 慢 10-30%（xy irfft2 + splat 仍是瓶颈）。内存约 +1× PSF 缓存（在原本几百 MB 量级里增加可忽略）。
+
+#### I. 验证计划
+
+对照 §2.7 的 C1-C6 改写为 sinc 版本：
+
+| 测试 | 内容 | PASS 阈值 |
+|---|---|---|
+| **Z1**（守恒律） | $\sum_n \widehat{g_z}^{\text{cont}}(f_n)/Z \to \int g_z \,\mathrm{d}z = \sigma_z\sqrt{2\pi}$（DC 项即可） | rel err < 1e-6 |
+| **Z2**（$\sigma_z \to \infty$ 极限） | $\widehat{g_z}$ 集中在 DC，结果应趋向 PSF 在 z 上平均 | rel err < 1e-3 |
+| **Z3**（$\sigma_z \to 0$ 极限） | Gaussian 退化为 Dirac，结果应趋向 PSF sinc 插值在 $\mu_z$ 处的值 | rel err < 1% |
+| **Z4**（$\mu_z$ 子像素平滑） | 扫描 $\mu_z \in [5.0, 6.0]$，输出 $C^\infty$ 平滑 | smoothness ratio < 3 |
+| **Z5**（FD vs autograd ∂L/∂μ_z, ∂L/∂σ_z） | 偏心 pixel readout loss | rel err < 1e-2 |
+| **Z6**（vs upsampled reference） | PSF 在 z 上 10× upsample 做 dense forward 比较 | rel L2 < 0.5% |
+| **Z7**（vs Phase 1 在大 $\sigma_z$） | $\sigma_z = 5$ 时 Phase 1 与 Phase 2 sinc 应几乎一致（z 上量化误差被 Gaussian 大尺度平滑掉） | rel L2 < 5% |
+
+Z6 是 sinc forward 的**黄金参考**——在 fine z grid 上把 PSF 用 sinc 插值上采样，然后直接做 dense forward。Phase 2 公式与该参考的差距应该接近 0（仅有 wraparound 项 ~1e-39）。
 
 ---
 
