@@ -1,7 +1,7 @@
 """Intensity voxelizer wrapper — 迁移自 3DGAT 的 us_gaussian_voxelization。
 
 先决条件（一次性）：
-    cd /root/autodl-tmp/3DGAT/submodules/us_gaussian_voxelization
+    cd submodules/us_gaussian_voxelization
     pip install -e .
 """
 import torch
