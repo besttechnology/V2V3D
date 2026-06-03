@@ -311,13 +311,21 @@ class V2V3D_Gauss(nn.Module):
 
     def _branch(self, unet, feats_sub):
         raw = unet(feats_sub)                   # (1, 11, D, H, W)
+        _, _, D, H, W = raw.shape
+        if D == self.n_slice and H == self.H and W == self.W:
+            grid = self.grid_centers
+            vox = self.voxelizer
+        else:
+            grid = make_grid_centers(D=D, H=H, W=W, device=raw.device, dtype=raw.dtype)
+            from voxelizer import IntensityVoxelizer
+            vox = IntensityVoxelizer(n_slice=D, H=H, W=W).to(raw.device)
         gp = decoder_output_to_gaussians(
-            raw, self.grid_centers,
+            raw, grid,
             scale_init=self.scale_init,
             max_offset=self.max_offset,
             s_min=self.s_min, s_max=self.s_max,
         )
-        volume, _ = self.voxelizer(
+        volume, _ = vox(
             gp['positions'], gp['densities'], gp['scales'], gp['rotations'],
         )
         # volume: (D, H, W) → (1, D, H, W) 以匹配原 V2V3D 约定（train loop 会 squeeze）
