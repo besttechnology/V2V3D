@@ -37,14 +37,15 @@ def decoder_output_to_gaussians(raw, grid_centers, scale_init=0.5,
     s_log     = raw[:, 4:7]               # (B, 3, D, H, W)
     q_raw     = raw[:, 7:11]              # (B, 4, D, H, W)
 
-    # 激活
-    rho = F.softplus(rho_logit)
-    mu_delta = torch.nan_to_num(torch.tanh(mu_offset), nan=0.0) * max_offset  # NaN → 0 防止 position 污染
-    s = torch.exp(s_log.clamp(-10, 10)) * scale_init       # clamp log 防止 exp 上溢/NaN
+    # 激活（所有参数均做 NaN/Inf 保护，防止 CUDA voxelizer 产生全 NaN 输出）
+    rho = torch.nan_to_num(F.softplus(rho_logit), nan=0.0)
+    mu_delta = torch.nan_to_num(torch.tanh(mu_offset), nan=0.0) * max_offset
+    s = torch.exp(s_log.clamp(-10, 10)) * scale_init
     s_clamp_max = s_max if s_max is not None else 1e6
     s_clamp_min = s_min if s_min is not None else 1e-6
     s = s.clamp(min=s_clamp_min, max=s_clamp_max)
     s = torch.nan_to_num(s, nan=scale_init, posinf=s_clamp_max, neginf=s_clamp_min)
+    q_raw = torch.nan_to_num(q_raw, nan=0.0)               # NaN → 0 后再归一化
     q = F.normalize(q_raw, dim=1, eps=1e-8)
 
     # flatten 到 (N, *)
