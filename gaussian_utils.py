@@ -39,7 +39,7 @@ def decoder_output_to_gaussians(raw, grid_centers, scale_init=0.5,
 
     # 激活
     rho = F.softplus(rho_logit)
-    mu_delta = torch.tanh(mu_offset) * max_offset          # 限制在 voxel 内
+    mu_delta = torch.nan_to_num(torch.tanh(mu_offset), nan=0.0) * max_offset  # NaN → 0 防止 position 污染
     s = torch.exp(s_log.clamp(-10, 10)) * scale_init       # clamp log 防止 exp 上溢/NaN
     s_clamp_max = s_max if s_max is not None else 1e6
     s_clamp_min = s_min if s_min is not None else 1e-6
