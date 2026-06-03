@@ -48,6 +48,8 @@ def parse_args():
     parser.add_argument('--gauss_lambda_aniso', type=float, default=1e-4)
     parser.add_argument('--gauss_reg_warmup', type=int, default=2,
                         help='前几个 epoch 不施加 Gaussian 正则，只用 MSE')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                        help='Gaussian 分支梯度裁剪上限，防止 voxelizer 反传梯度爆炸')
 
     return parser.parse_args()
 
@@ -138,7 +140,20 @@ def train(args):
                     )
                 
                 optimizer.zero_grad()
+                # NaN/Inf 守卫：loss 非有限时跳过本步，避免污染权重
+                if args.use_gaussian and not torch.isfinite(loss):
+                    print('[WARN] non-finite loss, skip step at epoch %d iter %d' % (epoch+1, iter+1))
+                    iter += 1
+                    continue
                 loss.backward()
+                if args.use_gaussian:
+                    # 梯度裁剪：拦截 voxelizer 反传的爆炸梯度（防止权重发散成 NaN）
+                    gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                    if not torch.isfinite(gnorm):
+                        print('[WARN] non-finite grad norm, skip step at epoch %d iter %d' % (epoch+1, iter+1))
+                        optimizer.zero_grad()
+                        iter += 1
+                        continue
                 optimizer.step()
                 iter += 1
 
