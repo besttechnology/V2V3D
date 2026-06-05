@@ -2,16 +2,21 @@ import torch
 import torch.nn.functional as F
 
 
-def make_grid_centers(D, H, W, device=None, dtype=torch.float32):
-    """预计算网格锚点世界坐标 (D, H, W, 3)。
+def make_grid_centers(D, H, W, vol_D=None, vol_H=None, vol_W=None,
+                      device=None, dtype=torch.float32):
+    """预计算锚点世界坐标 (D, H, W, 3)。
 
-    约定：sVoxel = nVoxel、center = nVoxel/2，每个 voxel 边长 = 1。
-    voxel (i,j,k) 中心世界坐标 = (i + 0.5, j + 0.5, k + 0.5)。
+    D,H,W 是锚点网格尺寸；vol_* 是目标体积（voxelizer 输出）尺寸，默认 = D,H,W。
+    锚点落在它所覆盖块的中心：coord = (i + 0.5) * (vol_N / N)。
+    当 vol == grid（每 voxel 一个锚点）时退化为 (i + 0.5)，即原行为。
     这里 3-vector 顺序 = (x, y, z) = (H 轴, W 轴, D 轴)。
     """
-    xs = torch.arange(H, device=device, dtype=dtype) + 0.5
-    ys = torch.arange(W, device=device, dtype=dtype) + 0.5
-    zs = torch.arange(D, device=device, dtype=dtype) + 0.5
+    vol_D = D if vol_D is None else vol_D
+    vol_H = H if vol_H is None else vol_H
+    vol_W = W if vol_W is None else vol_W
+    xs = (torch.arange(H, device=device, dtype=dtype) + 0.5) * (vol_H / H)
+    ys = (torch.arange(W, device=device, dtype=dtype) + 0.5) * (vol_W / W)
+    zs = (torch.arange(D, device=device, dtype=dtype) + 0.5) * (vol_D / D)
     zz, xx, yy = torch.meshgrid(zs, xs, ys, indexing='ij')  # (D, H, W)
     return torch.stack([xx, yy, zz], dim=-1)  # (D, H, W, 3)
 
@@ -64,24 +69,25 @@ def decoder_output_to_gaussians(raw, grid_centers, scale_init=0.5,
     }
 
 
-def init_gaussian_head_bias(final_conv, n_slice,
+def init_gaussian_head_bias(final_conv, Dp,
                             rho_bias=-5.0, scale_bias=0.0, q_bias=(1.0, 0.0, 0.0, 0.0)):
     """按文档 §4.4 初始化 GaussianHead 最后一层 bias。
 
-    final_conv 的输出顺序必须是 [rho, dx, dy, dz, sx, sy, sz, qw, qx, qy, qz] × n_slice。
+    Dp 是（粗化后的）锚点网格深度 D'，输出通道数 = 11 * Dp。
+    final_conv 的输出顺序必须是 [rho, dx, dy, dz, sx, sy, sz, qw, qx, qy, qz] × Dp。
     我们按通道分组写 bias：
-        channels [0 .. n_slice)          -> rho_bias
-        channels [n_slice .. 4*n_slice)  -> 0 (位置偏移)
-        channels [4*n_slice .. 7*n_slice) -> scale_bias
-        channels [7*n_slice .. 11*n_slice) -> q_bias (重复 n_slice 次)
+        channels [0 .. Dp)          -> rho_bias
+        channels [Dp .. 4*Dp)       -> 0 (位置偏移)
+        channels [4*Dp .. 7*Dp)     -> scale_bias
+        channels [7*Dp .. 11*Dp)    -> q_bias (重复 Dp 次)
     """
     with torch.no_grad():
         b = final_conv.bias
-        assert b.numel() == 11 * n_slice, f"bias size {b.numel()} != 11*{n_slice}"
+        assert b.numel() == 11 * Dp, f"bias size {b.numel()} != 11*{Dp}"
         b.zero_()
-        b[0:n_slice] = rho_bias
+        b[0:Dp] = rho_bias
         # 1..4: 位置偏移保持 0
-        b[4 * n_slice:7 * n_slice] = scale_bias
+        b[4 * Dp:7 * Dp] = scale_bias
         q_bias_t = torch.tensor(q_bias, dtype=b.dtype, device=b.device)
         for i, v in enumerate(q_bias_t):
-            b[(7 + i) * n_slice:(8 + i) * n_slice] = v
+            b[(7 + i) * Dp:(8 + i) * Dp] = v

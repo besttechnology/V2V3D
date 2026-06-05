@@ -50,6 +50,12 @@ def parse_args():
                         help='前几个 epoch 不施加 Gaussian 正则，只用 MSE')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='Gaussian 分支梯度裁剪上限，防止 voxelizer 反传梯度爆炸')
+    parser.add_argument('--gauss_coarse', type=int, default=1,
+                        help='高斯锚点 xy 粗化倍数（128→128/coarse），减少高斯数加速 voxelizer；1=每voxel一个')
+    parser.add_argument('--gauss_coarse_z', type=int, default=1,
+                        help='高斯锚点 z 粗化倍数（默认1=保留全部z切片，LFM中z分辨率重要）')
+    parser.add_argument('--gauss_lambda_vol', type=float, default=0.0,
+                        help='体素级L1稀疏权重(作用于渲染体积xguess，打破累加渲染铺底)；0=关闭')
 
     return parser.parse_args()
 
@@ -91,6 +97,7 @@ def train(args):
             input_size=args.input_size, use_views=u_res, feat_ch=args.feat_ch,
             scale_init=args.gauss_scale_init,
             s_min=args.gauss_s_min, s_max=args.gauss_s_max,
+            gauss_coarse=args.gauss_coarse, gauss_coarse_z=args.gauss_coarse_z,
         ).to(device)
         print('[V2V3D] use_gaussian=True — Gaussian Decoder + Intensity Voxelizer')
     else:
@@ -138,6 +145,10 @@ def train(args):
                         lambda_a=args.gauss_lambda_aniso,
                         s_max=args.gauss_s_max,
                     )
+                    # 体素级 L1：约束渲染后的体积(而非高斯参数)，直接惩罚铺底——
+                    # 高斯参数无法绕过(三次在rho/scale上的约束都被另一参数补偿了)
+                    if args.gauss_lambda_vol > 0:
+                        loss = loss + args.gauss_lambda_vol * (xguess1.abs().mean() + xguess2.abs().mean())
                 
                 optimizer.zero_grad()
                 # NaN/Inf 守卫：loss 非有限时跳过本步，避免污染权重

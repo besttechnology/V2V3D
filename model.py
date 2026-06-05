@@ -221,28 +221,36 @@ class V2V3D(nn.Module):
 
 
 class GaussianUnet(Unet):
-    """与原 Unet 结构相同，但最后一层输出 11*n_slice 通道。
+    """与原 Unet 结构相同，但最后一层输出 11*D' 通道（D' 为粗化后的锚点深度）。
 
-    输出 reshape 成 (B, 11, D, H, W) 供后续 voxelizer 使用。
-    通道排布：对每个 param i in [0..11)，占 n_slice 个连续 channel。
+    输出 reshape 成 (B, 11, D', H', W') 供后续 voxelizer 使用。
+    通道排布：对每个 param i in [0..11)，占 D' 个连续 channel。
+
+    粗化：coarse_xy 通过末层 stride 把 xy 降采样（H'=H//coarse_xy）；
+          coarse_z 通过 D'=round(n_slices/coarse_z) 减少 z 方向锚点数。
+          coarse_xy=coarse_z=1 时退化为每 voxel 一个高斯（原行为）。
     """
 
-    def __init__(self, n_slices, input_channel):
+    def __init__(self, n_slices, input_channel, coarse_xy=1, coarse_z=1):
         super().__init__(n_slices=n_slices, input_channel=input_channel)
         self.n_slice = n_slices
-        # 替换最后一层：输出通道 1*n_slice -> 11*n_slice
-        out_ch = 11 * n_slices
+        self.coarse_xy = int(coarse_xy)
+        self.coarse_z = int(coarse_z)
+        self.Dp = int(round(n_slices / self.coarse_z))   # 粗化后锚点深度 D'
+        # 替换最后一层：输出通道 11*D'，并用 stride=coarse_xy 降采样 xy
+        out_ch = 11 * self.Dp
         self.conv_final = nn.Sequential(
             nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.01),
             nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.01),
-            nn.Conv2d(in_channels=128, out_channels=out_ch, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels=128, out_channels=out_ch, kernel_size=3,
+                      stride=self.coarse_xy, padding=1),
             # 注意：不再接 LeakyReLU — 参数激活在 decoder_output_to_gaussians 内处理
         )
 
     def forward(self, x):
-        # 走父类整条 UNet（conv_final 已被本类替换为 11*D 通道、去掉尾部 LeakyReLU）
+        # 走父类整条 UNet（conv_final 已被本类替换为 11*D' 通道、可降采样、去掉尾部 LeakyReLU）
         f = self.init_conv(x)
         encoder_layers = [f]
         f = self.encoder_1(f); encoder_layers.append(f)
@@ -255,11 +263,10 @@ class GaussianUnet(Unet):
         f = torch.cat((encoder_layers[2], f), dim=1); f = self.decoder_2(f)
         f = torch.cat((encoder_layers[1], f), dim=1); f = self.decoder_3(f)
         f = torch.cat((encoder_layers[0], f), dim=1); f = self.decoder_4(f)
-        f = self.conv_final(f)  # (B, 11*n_slice, H, W)
-        B, C, H, W = f.shape
-        D = self.n_slice
-        # (B, 11, D, H, W)
-        return f.reshape(B, 11, D, H, W)
+        f = self.conv_final(f)  # (B, 11*D', H', W')
+        B, C, Hp, Wp = f.shape
+        # (B, 11, D', H', W')
+        return f.reshape(B, 11, self.Dp, Hp, Wp)
 
 
 class V2V3D_Gauss(nn.Module):
@@ -272,7 +279,8 @@ class V2V3D_Gauss(nn.Module):
 
     def __init__(self, warp_psfs, n_slice, select_v, remain_v,
                  input_size, use_views=13, feat_ch=4,
-                 scale_init=0.5, s_min=0.1, s_max=None, max_offset=0.5):
+                 scale_init=0.5, s_min=0.1, s_max=None, max_offset=0.5,
+                 gauss_coarse=1, gauss_coarse_z=1):
         super().__init__()
         self.use_v = use_views
         self.feat_ch = feat_ch
@@ -280,45 +288,62 @@ class V2V3D_Gauss(nn.Module):
         self.remain_v = remain_v
         self.n_slice = n_slice
         self.H = self.W = input_size
-        self.scale_init = scale_init
+        self.coarse_xy = int(gauss_coarse)
+        self.coarse_z = int(gauss_coarse_z)
+        # 粗化后高斯更稀疏，需适度放大；但 scale 用 sqrt 而非线性放大——
+        # 线性放大(coarse)会让高斯过度重叠、渲染出高基底"铺底"退化解(PSNR崩)。
+        # sqrt 放大刚好覆盖粗块又不过度重叠；offset 保持线性放大，让高斯能在块内移到信号处。
+        coarse = max(self.coarse_xy, self.coarse_z)
+        self.scale_init = scale_init * (coarse ** 0.5)
         self.s_min = s_min
         self.s_max = s_max
-        self.max_offset = max_offset
+        self.max_offset = max_offset * coarse
 
         self.warp_psfs = warp_psfs
         self.feat_extract = Feature(in_channels=1, out_channels=feat_ch)
         self.unet1 = GaussianUnet(n_slices=n_slice,
-                                  input_channel=feat_ch * select_v.shape[0] * n_slice)
+                                  input_channel=feat_ch * select_v.shape[0] * n_slice,
+                                  coarse_xy=self.coarse_xy, coarse_z=self.coarse_z)
         self.unet2 = GaussianUnet(n_slices=n_slice,
-                                  input_channel=feat_ch * remain_v.shape[0] * n_slice)
+                                  input_channel=feat_ch * remain_v.shape[0] * n_slice,
+                                  coarse_xy=self.coarse_xy, coarse_z=self.coarse_z)
 
-        # lazy import to avoid hard dep when flag off
+        # voxelizer 输出体积保持全分辨率 (n_slice, input_size, input_size) —— 不随粗化改变
         from voxelizer import IntensityVoxelizer
         self.voxelizer = IntensityVoxelizer(n_slice=n_slice, H=input_size, W=input_size)
 
-        # 预计算网格锚点；注册为 buffer 便于 .to(device)
-        grid = make_grid_centers(D=n_slice, H=input_size, W=input_size)
+        # 预计算粗化锚点网格 (D', H', W')，坐标映射到全分辨率体积世界系；注册为 buffer
+        Dp = self.unet1.Dp
+        Hp = input_size // self.coarse_xy
+        grid = make_grid_centers(D=Dp, H=Hp, W=Hp,
+                                 vol_D=n_slice, vol_H=input_size, vol_W=input_size)
         self.register_buffer('grid_centers', grid, persistent=False)
 
-        # 权重初始化 + 专门的 bias 初始化
+        # 权重初始化 + 专门的 bias 初始化（用粗化深度 D'）
         self.weight_init(mean=0.0, std=0.02)
-        init_gaussian_head_bias(self.unet1.conv_final[-1], n_slice)
-        init_gaussian_head_bias(self.unet2.conv_final[-1], n_slice)
+        init_gaussian_head_bias(self.unet1.conv_final[-1], self.unet1.Dp)
+        init_gaussian_head_bias(self.unet2.conv_final[-1], self.unet2.Dp)
 
     def weight_init(self, mean, std):
         for m in self._modules:
             normal_init(self._modules[m], mean, std)
 
     def _branch(self, unet, feats_sub):
-        raw = unet(feats_sub)                   # (1, 11, D, H, W)
-        _, _, D, H, W = raw.shape
-        if D == self.n_slice and H == self.H and W == self.W:
+        raw = unet(feats_sub)                   # (1, 11, D', H', W') 粗化锚点网格
+        _, _, Dp, Hp, Wp = raw.shape
+        # 锚点网格 → 全分辨率体积尺寸：xy 乘回 coarse_xy，z 固定 = n_slice
+        vol_H = Hp * self.coarse_xy
+        vol_W = Wp * self.coarse_xy
+        vol_D = self.n_slice
+        if vol_H == self.H and vol_W == self.W:
             grid = self.grid_centers
             vox = self.voxelizer
         else:
-            grid = make_grid_centers(D=D, H=H, W=W, device=raw.device, dtype=raw.dtype)
+            grid = make_grid_centers(D=Dp, H=Hp, W=Wp,
+                                     vol_D=vol_D, vol_H=vol_H, vol_W=vol_W,
+                                     device=raw.device, dtype=raw.dtype)
             from voxelizer import IntensityVoxelizer
-            vox = IntensityVoxelizer(n_slice=D, H=H, W=W).to(raw.device)
+            vox = IntensityVoxelizer(n_slice=vol_D, H=vol_H, W=vol_W).to(raw.device)
         gp = decoder_output_to_gaussians(
             raw, grid,
             scale_init=self.scale_init,

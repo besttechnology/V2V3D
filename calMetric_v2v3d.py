@@ -16,7 +16,7 @@ def calBacknoise(img, bins=100):
 # 1. 修改为文件夹路径 (请确保路径末尾没有文件名)
 folder1_path = 'Dataset/Samples_test/'  # Ground Truth folder
 #folder2_path = 'Dataset/V2V3D_recon/'   # Recon folder
-folder2_path = 'Results/04_12_21_03_V2V3D_F4_LFIs_test'   # Recon folder
+folder2_path = 'Dataset/V2V3D_recon'   # Recon folder
 
 ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
 psnr = PeakSignalNoiseRatio(data_range=1.0)
