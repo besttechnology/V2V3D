@@ -56,6 +56,8 @@ def parse_args():
                         help='高斯锚点 z 粗化倍数（默认1=保留全部z切片，LFM中z分辨率重要）')
     parser.add_argument('--gauss_lambda_vol', type=float, default=0.0,
                         help='体素级L1稀疏权重(作用于渲染体积xguess，打破累加渲染铺底)；0=关闭')
+    parser.add_argument('--save_every', type=int, default=0,
+                        help='每多少 epoch 存一次 checkpoint；0=沿用旧逻辑(epochs/5)')
 
     return parser.parse_args()
 
@@ -180,7 +182,8 @@ def train(args):
         writer.add_image('CV GT', normal(remain_lfs[0,...].unsqueeze(0)), epoch)
         
         if epoch%int(epochs/10)==0 or epoch+1 == epochs: test2b(test_lfs, model, epoch, result_dir, args.log)
-        if (epoch+1)%int(epochs/5)==0 or epoch+1 == epochs: save_ckpt(model, ckpt_dir, epoch)
+        save_interval = args.save_every if args.save_every > 0 else max(1, int(epochs/5))
+        if (epoch+1)%save_interval==0 or epoch+1 == epochs: save_ckpt(model, ckpt_dir, epoch)
 
 if __name__ == '__main__':
     args = parse_args()
